@@ -120,8 +120,8 @@ class AutomationAccessibilityService : AccessibilityService() {
             val exec = Executor { it.run() }
             takeScreenshot(
                 Display.DEFAULT_DISPLAY, exec,
-                object : ScreenshotCallback {
-                    override fun onSuccess(result: ScreenshotResult) {
+                object : AccessibilityService.TakeScreenshotCallback {
+    override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
                         try {
                             val hw = result.hardwareBitmap
                             out = hw.copy(Bitmap.Config.ARGB_8888, false)
