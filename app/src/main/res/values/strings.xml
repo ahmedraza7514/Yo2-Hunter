@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Yo2 Auto-Claim</string>
+    <string name="accessibility_service_description">Automatically detects and claims red envelopes in the Yo2 app.</string>
+</resources>
