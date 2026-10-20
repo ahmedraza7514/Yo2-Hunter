@@ -6,387 +6,486 @@ import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
-import android.os.Handler
-import android.os.HandlerThread
-import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executor
-import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 
-/**
- * Yo2 red-envelope auto claimer — Ahmed Bhai's spec (memory/yo2-autoclaim-spec.md).
- *
- * WATCHING -> banner tap -> TIPS_WAIT -> OK -> ROOM_CLASSIFY ->
- *   DIRECT (Open nazar aaye) -> tap Open -> CLAIM_CHECK
- *   COUNTDOWN (timer nazar aaye) -> FAST_TAP (Open aane tak; beech mein DIRECT
- *     banner aaye to PRIORITY preempt) -> tap Open -> CLAIM_CHECK
- * CLAIM_CHECK -> claimed/expired -> EXIT_FLOW (X -> power -> EXIT bubble) -> WATCHING
- */
 class AutomationAccessibilityService : AccessibilityService() {
 
-    private enum class State { WATCHING, TIPS_WAIT, ROOM_CLASSIFY, FAST_TAP, CLAIM_CHECK, EXIT_FLOW }
+    private lateinit var prefs: AppPreferences
+    private var overlayManager: OverlayManager? = null
 
-    private var state = State.WATCHING
-    private var stateSince = System.currentTimeMillis()
-    private var exitStep = 0
-    private var timerBox: Rect? = null
-    private var wasDirect = false
-    private var lastBannerTap = 0L
-    private var screenshotWarned = false
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var loopJob: Job? = null
+    private var flowJob: Job? = null
 
-    private var worker: HandlerThread? = null
-    private var handler: Handler? = null
-    private var running = false
+    @Volatile
+    private var flowRunning = false
 
-    private val timerRe = Regex("""^(\d{1,2}):([0-5]\d)$""")
+    private var currentPackage: String = ""
+    private var visualCycleCount = 0
+    private var lastScreenshotMs = 0L
+    private var lastBannerTapMs = 0L
 
-    // ---------------- lifecycle ----------------
-
-    override fun onServiceConnected() {
-        Prefs.init(this)
-        LogStore.add("SVC", "service connected (API ${Build.VERSION.SDK_INT})")
-        OverlayManager.init(this)
-        startWorker()
+    private val stateListener: () -> Unit = {
+        overlayManager?.refresh()
+        if (AutomationStateMachine.isRunning()) {
+            if (loopJob?.isActive != true) startScanLoop()
+            val om = overlayManager
+            if (om != null && prefs.showFloatingOverlay) {
+                mainHandlerPost { om.show(); om.refresh() }
+            }
+        } else {
+            stopScanLoop()
+            mainHandlerPost { overlayManager?.dismiss() }
+        }
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
-    override fun onInterrupt() { LogStore.add("SVC", "interrupted") }
+    private fun mainHandlerPost(block: () -> Unit) {
+        android.os.Handler(mainLooper).post(block)
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        prefs = AppPreferences(this)
+        overlayManager = OverlayManager(this)
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        isServiceConnected = true
+        AutomationStateMachine.addLog("Accessibility Service Connected & Ready", "SUCCESS")
+        AutomationStateMachine.addListener(stateListener)
+        if (AutomationStateMachine.isRunning()) {
+            startScanLoop()
+            if (prefs.showFloatingOverlay) overlayManager?.show()
+        }
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        val pkg = event.packageName?.toString()?.lowercase() ?: return
+        if (pkg == packageName.lowercase()) return
+        currentPackage = pkg
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        if (pkg.contains("systemui") || pkg.contains("inputmethod") || pkg.contains("launcher")) return
+
+        val isYo2Active = prefs.getTargetPackagesList().any { pkg.contains(it) }
+        if (isYo2Active) {
+            if (AutomationStateMachine.currentState == AutomationState.PAUSED && prefs.autoResume) {
+                AutomationStateMachine.resume()
+            }
+        } else {
+            if (AutomationStateMachine.isRunning() &&
+                AutomationStateMachine.currentState != AutomationState.PAUSED
+            ) {
+                AutomationStateMachine.pause("Switched to $pkg - Paused")
+            }
+        }
+    }
+
+    override fun onInterrupt() {
+        AutomationStateMachine.addLog("Accessibility service interrupted", "WARN")
+    }
 
     override fun onDestroy() {
-        running = false
-        try { worker?.quitSafely() } catch (_: Exception) {}
+        isServiceConnected = false
+        AutomationStateMachine.removeListener(stateListener)
+        stopScanLoop()
+        overlayManager?.dismiss()
+        serviceScope.cancel()
         super.onDestroy()
     }
 
-    private fun startWorker() {
-        if (running) return
-        running = true
-        worker = HandlerThread("yo2-worker").apply { start() }
-        handler = Handler(worker!!.looper)
-        handler?.post { loop() }
-        LogStore.add("SVC", "worker started")
-    }
-
-    // ---------------- main loop ----------------
-
-    private fun loop() {
-        if (!running) return
-        try {
-            if (!Prefs.enabled) {
-                sleepMs(1000)
-            } else {
-                when (state) {
-                    State.WATCHING -> doWatching()
-                    State.TIPS_WAIT -> doTipsWait()
-                    State.ROOM_CLASSIFY -> doRoomClassify()
-                    State.FAST_TAP -> doFastTap()
-                    State.CLAIM_CHECK -> doClaimCheck()
-                    State.EXIT_FLOW -> doExitFlow()
-                }
-            }
-        } catch (e: Exception) {
-            LogStore.add("ERR", "loop: ${e.message}")
-            sleepMs(1000)
-        }
-        handler?.post { loop() }
-    }
-
-    private fun setState(s: State) {
-        state = s
-        stateSince = System.currentTimeMillis()
-        if (s == State.EXIT_FLOW) exitStep = 0
-        LogStore.add("STATE", s.name)
-    }
-
-    private fun elapsed() = System.currentTimeMillis() - stateSince
-    private fun sleepMs(ms: Long) { try { Thread.sleep(ms) } catch (_: InterruptedException) {} }
-
-    // ---------------- primitives ----------------
-
-    /** Screenshot via AccessibilityService API (Android 11+). Null on older versions. */
-    private fun shot(): Bitmap? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            if (!screenshotWarned) {
-                screenshotWarned = true
-                LogStore.add("SVC", "screenshot ke liye Android 11+ chahiye")
-            }
-            return null
-        }
-        return try {
-            val latch = CountDownLatch(1)
-            var out: Bitmap? = null
-            val exec = Executor { it.run() }
-            takeScreenshot(
-                Display.DEFAULT_DISPLAY, exec,
-                object : AccessibilityService.TakeScreenshotCallback {
-    override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
-                        try {
-                           val buffer = result.hardwareBuffer
-val wrapped = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace)
-if (wrapped != null) {
-    out = wrapped.copy(Bitmap.Config.ARGB_8888, false)
-    wrapped.recycle()
-}
-buffer.close()
-                        } catch (_: Exception) {}
-                        latch.countDown()
+    private fun startScanLoop() {
+        loopJob?.cancel()
+        loopJob = serviceScope.launch {
+            while (isActive && AutomationStateMachine.isRunning()) {
+                try {
+                    if (AutomationStateMachine.currentState != AutomationState.PAUSED && !flowRunning) {
+                        processScreenCycle()
                     }
-                    override fun onFailure(errorCode: Int) { latch.countDown() }
-                })
-            latch.await(4, TimeUnit.SECONDS)
-            out
-        } catch (e: Exception) {
-            LogStore.add("ERR", "shot: ${e.message}")
-            null
+                } catch (e: Exception) {
+                }
+                delay(prefs.scanIntervalMs.coerceIn(120L, 2000L))
+            }
         }
     }
 
-    private fun tap(x: Float, y: Float) {
-        try {
-            val path = Path().apply { moveTo(x, y) }
-            val stroke = GestureDescription.StrokeDescription(path, 0, 70)
-            val gd = GestureDescription.Builder().addStroke(stroke).build()
-            dispatchGesture(gd, null, null)
-        } catch (e: Exception) {
-            LogStore.add("ERR", "tap: ${e.message}")
-        }
+    private fun stopScanLoop() {
+        loopJob?.cancel()
+        loopJob = null
+        flowJob?.cancel()
+        flowJob = null
+        flowRunning = false
     }
 
-    private fun tapRect(r: Rect) = tap(r.centerX().toFloat(), r.centerY().toFloat())
+    private suspend fun processScreenCycle() {
+        val root = rootInActiveWindow ?: return
+        val pkg = root.packageName?.toString()?.lowercase() ?: return
+        if (pkg == packageName.lowercase()) return
+        if (!prefs.getTargetPackagesList().any { pkg.contains(it) }) return
 
-    private fun findNodeByText(text: String): AccessibilityNodeInfo? {
-        return try {
-            val root = rootInActiveWindow ?: return null
-            val list = root.findAccessibilityNodeInfosByText(text)
-            val node = list.firstOrNull()
-            list.filter { it != node }.forEach { try { it.recycle() } catch (_: Exception) {} }
-            node
-        } catch (_: Exception) { null }
-    }
-
-    // ---------------- states ----------------
-
-    /** Top strip scan for the red banner (2-3s window — poll fast). */
-    private fun doWatching() {
-        val bmp = shot() ?: return sleepMs(700)
-        val banner = Vision.findBanner(bmp)
-        bmp.recycle()
+        val targets = TargetDetection.scanScreen(
+            root,
+            prefs.getEnvelopeKeywordsList(),
+            prefs.getOpenKeywordsList(),
+            prefs.getSuccessKeywordsList()
+        )
+        val banner = targets.firstOrNull { it.targetType == TargetDetection.TargetType.FLOATING_ENVELOPE }
         val now = System.currentTimeMillis()
-        if (banner != null && now - lastBannerTap > 4000) {
-            lastBannerTap = now
-            Prefs.detected++
-            OverlayManager.refresh()
-            LogStore.add("FLOW", "Banner! type=${banner.type} — tap kar raha")
-            tapRect(banner.box)
-            setState(State.TIPS_WAIT)
-        } else {
-            sleepMs(600)
+        if (banner != null && now - lastBannerTapMs > BANNER_THROTTLE_MS) {
+            lastBannerTapMs = now
+            AutomationStateMachine.onEnvelopeDetected(banner.textSnippet.take(40))
+            startRoomFlow(banner, null, null)
+            return
         }
-    }
 
-    /** "Tips" dialog -> OK button. */
-    private fun doTipsWait() {
-        if (elapsed() > 10_000) {
-            LogStore.add("WARN", "Tips timeout — wapas watch")
-            setState(State.WATCHING); return
-        }
-        val okNode = findNodeByText("OK") ?: findNodeByText("Ok")
-        if (okNode != null) {
-            LogStore.add("FLOW", "Tips -> OK dabaya")
-            try { okNode.performAction(AccessibilityNodeInfo.ACTION_CLICK) } catch (_: Exception) {}
-            try { okNode.recycle() } catch (_: Exception) {}
-            sleepMs(1600)
-            setState(State.ROOM_CLASSIFY); return
-        }
-        val bmp = shot()
-        if (bmp != null) {
-            val lines = OcrHelper.recognize(bmp)
-            val ok = lines.firstOrNull { it.text.trim().equals("OK", ignoreCase = true) && it.box != null }
-            if (ok?.box != null) {
-                LogStore.add("FLOW", "Tips -> OK (OCR) dabaya")
-                tapRect(ok.box!!)
+        visualCycleCount++
+        if (visualCycleCount % 4 == 0 && now - lastBannerTapMs > BANNER_THROTTLE_MS) {
+            val bmp = captureScreen() ?: return
+            try {
+                val tb = VisualDetection.analyzeTopBanner(bmp)
+                if (tb.present) {
+                    lastBannerTapMs = now
+                    AutomationStateMachine.onEnvelopeDetected("visual banner red=${"%.2f".format(tb.redRatio)}")
+                    startRoomFlow(null, tb.tapX, tb.tapY)
+                }
+            } finally {
                 bmp.recycle()
-                sleepMs(1600)
-                setState(State.ROOM_CLASSIFY); return
             }
-            bmp.recycle()
         }
-        sleepMs(600)
     }
 
-    /** Room mein: Open (direct) ya timer (countdown)? */
-    private fun doRoomClassify() {
-        if (elapsed() > 15_000) {
-            LogStore.add("WARN", "classify timeout — exit")
-            setState(State.EXIT_FLOW); return
+    private fun startRoomFlow(
+        banner: TargetDetection.IdentifiedTarget?,
+        visualTapX: Int?,
+        visualTapY: Int?
+    ) {
+        if (flowRunning) return
+        flowJob = serviceScope.launch {
+            flowRunning = true
+            try {
+                runRoomFlow(banner, visualTapX, visualTapY)
+            } catch (e: Exception) {
+                AutomationStateMachine.addLog("Flow error: ${e.message}", "WARN")
+            } finally {
+                flowRunning = false
+                AutomationStateMachine.onWaitingNext()
+            }
         }
-        val bmp = shot() ?: return sleepMs(600)
-        val lines = OcrHelper.recognize(bmp)
-        val w = bmp.width; val h = bmp.height
-
-        if (lines.any { it.text.contains("received completely", ignoreCase = true) }) {
-            Prefs.expired++; OverlayManager.refresh()
-            LogStore.add("FLOW", "pehle hi khatam (received completely)")
-            bmp.recycle(); setState(State.EXIT_FLOW); return
-        }
-        val open = lines.firstOrNull { it.text.trim().equals("Open", ignoreCase = true) && it.box != null }
-        if (open?.box != null) {
-            wasDirect = true
-            LogStore.add("FLOW", "DIRECT envelope — Open tap!")
-            tapRect(open.box!!)
-            bmp.recycle(); sleepMs(1200); setState(State.CLAIM_CHECK); return
-        }
-        val timer = lines.firstOrNull {
-            it.box != null && timerRe.matches(it.text.trim()) &&
-                    it.box!!.centerX() > w * 0.25 && it.box!!.centerX() < w * 0.75 &&
-                    it.box!!.centerY() > h * 0.40 && it.box!!.centerY() < h * 0.80
-        }
-        if (timer?.box != null) {
-            wasDirect = false
-            timerBox = timer.box
-            LogStore.add("FLOW", "Countdown ${timer.text.trim()} — fast tap shuru")
-            bmp.recycle(); setState(State.FAST_TAP); return
-        }
-        bmp.recycle()
-        sleepMs(700)
     }
 
-    /** Timer par fast tap jab tak "Open" na aaye. Beech mein DIRECT banner = PRIORITY preempt. */
-    private fun doFastTap() {
-        if (elapsed() > 7 * 60_000) {
-            LogStore.add("WARN", "countdown timeout (7min) — exit")
-            setState(State.EXIT_FLOW); return
+    private suspend fun runRoomFlow(
+        banner: TargetDetection.IdentifiedTarget?,
+        visualTapX: Int?,
+        visualTapY: Int?
+    ) {
+        if (banner != null) {
+            tapTarget(banner)
+        } else if (visualTapX != null && visualTapY != null) {
+            tapXY(visualTapX, visualTapY)
         }
-        timerBox?.let { tapRect(it) }
+        delay(900)
 
-        val bmp = shot() ?: return sleepMs(300)
-        val lines = OcrHelper.recognize(bmp)
-        val w = bmp.width; val h = bmp.height
+        handleTipsDialog()
 
-        val open = lines.firstOrNull { it.text.trim().equals("Open", ignoreCase = true) && it.box != null }
-        if (open?.box != null) {
-            LogStore.add("FLOW", "OPEN aa gaya! tap!")
-            tapRect(open.box!!)
-            bmp.recycle(); sleepMs(1200); setState(State.CLAIM_CHECK); return
+        var enteredRoom = false
+        var openBtn: TargetDetection.IdentifiedTarget? = null
+        var countdown: TargetDetection.IdentifiedTarget? = null
+        var visualReady: VisualDetection.Result? = null
+        val classifyDeadline = System.currentTimeMillis() + 12_000
+        var cycle = 0
+        while (System.currentTimeMillis() < classifyDeadline) {
+            val root = rootInActiveWindow
+            val targets = TargetDetection.scanScreen(
+                root,
+                prefs.getEnvelopeKeywordsList(),
+                prefs.getOpenKeywordsList(),
+                prefs.getSuccessKeywordsList()
+            )
+            openBtn = targets.firstOrNull { it.targetType == TargetDetection.TargetType.OPEN_BUTTON }
+            countdown = targets.firstOrNull { it.targetType == TargetDetection.TargetType.COUNTDOWN_LABEL }
+            if (openBtn != null || countdown != null) {
+                enteredRoom = true
+                break
+            }
+            if (cycle % 2 == 0) {
+                val bmp = captureScreen()
+                if (bmp != null) {
+                    try {
+                        val vr = VisualDetection.analyzeBanner(bmp)
+                        if (vr.envelopeReady) {
+                            visualReady = vr
+                            enteredRoom = true
+                            break
+                        }
+                    } finally {
+                        bmp.recycle()
+                    }
+                }
+            }
+            cycle++
+            delay(250)
         }
-        if (lines.any { it.text.contains("received completely", ignoreCase = true) }) {
-            Prefs.expired++; OverlayManager.refresh()
-            LogStore.add("FLOW", "received completely — exit")
-            bmp.recycle(); setState(State.EXIT_FLOW); return
-        }
-        val t = lines.firstOrNull {
-            it.box != null && timerRe.matches(it.text.trim()) &&
-                    it.box!!.centerX() > w * 0.25 && it.box!!.centerX() < w * 0.75 &&
-                    it.box!!.centerY() > h * 0.40 && it.box!!.centerY() < h * 0.80
-        }
-        if (t?.box != null) timerBox = t.box
 
-        // PRIORITY: oper DIRECT banner aaya?
+        if (!enteredRoom) {
+            AutomationStateMachine.onClaimFailed("room popup not found")
+            return
+        }
+
+        if (openBtn != null || visualReady != null) {
+            AutomationStateMachine.addLog("Direct envelope — tapping Open", "FLOW")
+            if (openBtn != null) tapTarget(openBtn) else tapPoint(OPEN_X, OPEN_Y)
+            verifyClaim(enteredRoom = true)
+            return
+        }
+
+        val cdSeconds = countdown?.countdownSeconds
+        AutomationStateMachine.onCountdownRunning(cdSeconds)
+        val tapDeadline = System.currentTimeMillis() +
+            minOf(((cdSeconds ?: 180) + 45) * 1000L, 7 * 60 * 1000L)
+        var lastPreemptTapMs = 0L
+        while (System.currentTimeMillis() < tapDeadline) {
+            val root = rootInActiveWindow
+            val targets = TargetDetection.scanScreen(
+                root,
+                prefs.getEnvelopeKeywordsList(),
+                prefs.getOpenKeywordsList(),
+                prefs.getSuccessKeywordsList()
+            )
+            val nowOpen = targets.firstOrNull { it.targetType == TargetDetection.TargetType.OPEN_BUTTON }
+            if (nowOpen != null) {
+                tapTarget(nowOpen)
+                verifyClaim(enteredRoom = true)
+                return
+            }
+            if (targets.any { isRealConfirmation(it) }) {
+                verifyClaim(enteredRoom = true)
+                return
+            }
+            val now = System.currentTimeMillis()
+            val freshBanner = targets.firstOrNull { it.targetType == TargetDetection.TargetType.FLOATING_ENVELOPE }
+            if (freshBanner != null && now - lastPreemptTapMs > 2500) {
+                lastPreemptTapMs = now
+                AutomationStateMachine.addLog("Direct banner preempted countdown", "FLOW")
+                tapTarget(freshBanner)
+                delay(900)
+                handleTipsDialog()
+                val root2 = rootInActiveWindow
+                val targets2 = TargetDetection.scanScreen(
+                    root2,
+                    prefs.getEnvelopeKeywordsList(),
+                    prefs.getOpenKeywordsList(),
+                    prefs.getSuccessKeywordsList()
+                )
+                val directNow = targets2.firstOrNull { it.targetType == TargetDetection.TargetType.OPEN_BUTTON }
+                if (directNow != null) {
+                    tapTarget(directNow)
+                    verifyClaim(enteredRoom = true)
+                    return
+                }
+            }
+            val cdNow = targets.firstOrNull { it.targetType == TargetDetection.TargetType.COUNTDOWN_LABEL }
+            if (cdNow != null) {
+                tapXY(cdNow.bounds.centerX(), cdNow.bounds.centerY())
+            } else {
+                tapPoint(OPEN_X, OPEN_Y)
+            }
+            delay(280)
+        }
+        AutomationStateMachine.onClaimFailed("countdown timeout")
+        exitFlow()
+    }
+
+    private suspend fun handleTipsDialog() {
+        val deadline = System.currentTimeMillis() + 6000
+        while (System.currentTimeMillis() < deadline) {
+            val root = rootInActiveWindow ?: return
+            val texts = TargetDetection.collectTexts(root)
+            val hasTips = texts.any { it.contains("Tips", ignoreCase = true) }
+            val okNode = TargetDetection.findNodeByText(root, listOf("OK"))
+            if (okNode != null && (hasTips || texts.size < 40)) {
+                tapTarget(okNode)
+                AutomationStateMachine.addLog("Tips dialog — OK tapped", "FLOW")
+                delay(900)
+                return
+            }
+            if (hasTips) {
+                tapPoint(TIPS_OK_X, TIPS_OK_Y)
+                AutomationStateMachine.addLog("Tips dialog — OK tapped (point)", "FLOW")
+                delay(900)
+                return
+            }
+            delay(300)
+        }
+    }
+
+    private suspend fun verifyClaim(enteredRoom: Boolean) {
+        AutomationStateMachine.onClaimPending()
+        val deadline = System.currentTimeMillis() + 10_000
+        var openRetries = 0
+        var lastRetryMs = 0L
+        while (System.currentTimeMillis() < deadline) {
+            val root = rootInActiveWindow
+            val targets = TargetDetection.scanScreen(
+                root,
+                prefs.getEnvelopeKeywordsList(),
+                prefs.getOpenKeywordsList(),
+                prefs.getSuccessKeywordsList()
+            )
+            val confirmation = targets.firstOrNull { isRealConfirmation(it) }
+            if (confirmation != null) {
+                val coins = extractCoins(root)
+                AutomationStateMachine.onClaimConfirmed(
+                    if (coins != null) "+$coins coins" else confirmation.textSnippet.take(40)
+                )
+                NotificationHelper.triggerClaimSuccessFeedback(
+                    this, prefs.enableSound, prefs.enableVibration
+                )
+                delay(700)
+                if (enteredRoom) exitFlow()
+                return
+            }
+            if (targets.any { it.targetType == TargetDetection.TargetType.CLAIM_FAILED_LABEL }) {
+                AutomationStateMachine.onClaimFailed("envelope finished")
+                if (enteredRoom) exitFlow()
+                return
+            }
+            val now = System.currentTimeMillis()
+            val openBtn = targets.firstOrNull { it.targetType == TargetDetection.TargetType.OPEN_BUTTON }
+            if (openBtn != null && openRetries < prefs.maxRetries && now - lastRetryMs > 2000) {
+                openRetries++
+                lastRetryMs = now
+                tapTarget(openBtn)
+            }
+            delay(400)
+        }
+        AutomationStateMachine.onClaimFailed("no confirmation")
+        if (enteredRoom) exitFlow()
+    }
+
+    private fun isRealConfirmation(target: TargetDetection.IdentifiedTarget): Boolean {
+        if (target.targetType != TargetDetection.TargetType.CLAIM_CONFIRMATION) return false
+        val s = target.textSnippet.lowercase()
+        return s.contains("received completely") || s.contains("lucky money") ||
+            s.contains("coins received") || s.contains("congratulations") ||
+            s.contains("deposited into your account")
+    }
+
+    private fun extractCoins(root: AccessibilityNodeInfo?): Int? {
+        val texts = TargetDetection.collectTexts(root)
+        var best: Int? = null
+        for (t in texts) {
+            val n = t.trim().replace(",", "").toIntOrNull()
+            if (n != null && n in 1..10_000_000) {
+                if (best == null || n > best!!) best = n
+            }
+        }
+        return best
+    }
+
+    private suspend fun exitFlow() {
+        tapPoint(CLOSE_X, CLOSE_Y)
+        delay(750)
+        tapPoint(POWER_X, POWER_Y)
+        delay(950)
+        tapPoint(EXIT_X, EXIT_Y)
+        delay(800)
+        AutomationStateMachine.addLog("Exit flow done — waiting for next banner", "FLOW")
+        delay(prefs.cooldownMs)
+    }
+
+    private suspend fun tapTarget(target: TargetDetection.IdentifiedTarget) {
+        val clickable = TargetDetection.findClickableNode(target.node)
+        if (clickable.isClickable) {
+            val ok = clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            if (ok) return
+        }
+        tapXY(target.bounds.centerX(), target.bounds.centerY())
+    }
+
+    private suspend fun tapPoint(fx: Float, fy: Float) {
+        val metrics = resources.displayMetrics
+        tapXY((metrics.widthPixels * fx).toInt(), (metrics.heightPixels * fy).toInt())
+    }
+
+    private suspend fun tapXY(x: Int, y: Int): Boolean = suspendCancellableCoroutine { cont ->
+        val path = Path().apply {
+            moveTo(x.toFloat(), y.toFloat())
+            lineTo(x.toFloat(), y.toFloat())
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 60))
+            .build()
+        val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                if (cont.isActive) cont.resume(true)
+            }
+
+            override fun onCancelled(gestureDescription: GestureDescription?) {
+                if (cont.isActive) cont.resume(false)
+            }
+        }, null)
+        if (!dispatched && cont.isActive) cont.resume(false)
+    }
+
+    private suspend fun captureScreen(): Bitmap? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
         val now = System.currentTimeMillis()
-        val banner = Vision.findBanner(bmp)
-        if (banner != null && banner.type == Vision.BannerType.DIRECT && now - lastBannerTap > 4000) {
-            lastBannerTap = now
-            Prefs.detected++; OverlayManager.refresh()
-            LogStore.add("FLOW", "PRIORITY! direct banner — countdown rok kar us par!")
-            tapRect(banner.box)
-            bmp.recycle(); setState(State.TIPS_WAIT); return
+        if (now - lastScreenshotMs < 350) return null
+        lastScreenshotMs = now
+        return suspendCancellableCoroutine { cont ->
+            takeScreenshot(0, mainExecutor, object : TakeScreenshotCallback {
+                override fun onSuccess(result: ScreenshotResult) {
+                    var bmp: Bitmap? = null
+                    try {
+                        val buffer = result.hardwareBuffer
+                        val wrapped = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace)
+                        if (wrapped != null) {
+                            bmp = wrapped.copy(Bitmap.Config.ARGB_8888, false)
+                            wrapped.recycle()
+                        }
+                        buffer.close()
+                    } catch (e: Exception) {
+                        bmp = null
+                    }
+                    if (cont.isActive) cont.resume(bmp)
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    if (cont.isActive) cont.resume(null)
+                }
+            })
         }
-        bmp.recycle()
-        sleepMs(300)
     }
 
-    /** Claim confirm: "Deposited into your account" / "Received" + coins gin lo. */
-    private fun doClaimCheck() {
-        if (elapsed() > 12_000) {
-            LogStore.add("WARN", "claim check timeout — exit")
-            setState(State.EXIT_FLOW); return
-        }
-        val bmp = shot() ?: return sleepMs(600)
-        val lines = OcrHelper.recognize(bmp)
-        bmp.recycle()
-        val all = lines.joinToString(" ") { it.text }
+    companion object {
+        @Volatile
+        var isServiceConnected: Boolean = false
+            private set
 
-        if (all.contains("received completely", ignoreCase = true)) {
-            Prefs.expired++; OverlayManager.refresh()
-            LogStore.add("FLOW", "received completely — exit")
-            setState(State.EXIT_FLOW); return
-        }
-        if (all.contains("Deposited into your account", ignoreCase = true) ||
-            all.contains("Received", ignoreCase = true)) {
-            val coins = Regex("""\d[\d,]*""").findAll(all)
-                .map { it.value.replace(",", "").toLongOrNull() ?: 0L }
-                .maxOrNull() ?: 0L
-            Prefs.coins += coins
-            if (wasDirect) Prefs.claimedDirect++ else Prefs.claimedCountdown++
-            OverlayManager.refresh()
-            LogStore.add("FLOW", "CLAIMED! +$coins coins ${if (wasDirect) "(direct)" else "(countdown)"}")
-            setState(State.EXIT_FLOW); return
-        }
-        val open = lines.firstOrNull { it.text.trim().equals("Open", ignoreCase = true) && it.box != null }
-        if (open?.box != null) {
-            tapRect(open.box!!); sleepMs(1200); return
-        }
-        sleepMs(700)
-    }
+        private const val OPEN_X = 0.5f
+        private const val OPEN_Y = 0.62f
+        private const val CLOSE_X = 0.5f
+        private const val CLOSE_Y = 0.755f
+        private const val POWER_X = 0.918f
+        private const val POWER_Y = 0.083f
+        private const val EXIT_X = 0.5f
+        private const val EXIT_Y = 0.607f
 
-    /** Exit: X -> power (top-right) -> EXIT bubble -> WATCHING. */
-    private fun doExitFlow() {
-        when (exitStep) {
-            0 -> {
-                val bmp = shot()
-                if (bmp != null) {
-                    val (x, y) = Vision.xButtonPos(bmp)
-                    bmp.recycle()
-                    LogStore.add("FLOW", "X dabaa raha")
-                    tap(x, y)
-                } else {
-                    tap(500f, 1500f)
-                }
-                sleepMs(900)
-                exitStep = 1
-            }
-            1 -> {
-                val bmp = shot()
-                if (bmp != null) {
-                    val w = bmp.width; val h = bmp.height
-                    bmp.recycle()
-                    LogStore.add("FLOW", "power button dabaa raha")
-                    tap(w * 0.93f, h * 0.105f)
-                } else {
-                    tap(530f, 135f)
-                }
-                sleepMs(1000)
-                exitStep = 2
-            }
-            2 -> {
-                val bmp = shot()
-                var tapped = false
-                if (bmp != null) {
-                    val lines = OcrHelper.recognize(bmp)
-                    val exit = lines.firstOrNull { it.text.trim().equals("EXIT", ignoreCase = true) && it.box != null }
-                    if (exit?.box != null) {
-                        LogStore.add("FLOW", "EXIT dabaa raha")
-                        tapRect(exit.box!!)
-                        tapped = true
-                    }
-                    val w = bmp.width; val h = bmp.height
-                    bmp.recycle()
-                    if (!tapped) {
-                        LogStore.add("FLOW", "EXIT (fallback position)")
-                        tap(w * 0.5f, h * 0.66f)
-                    }
-                } else {
-                    tap(288f, 922f)
-                }
-                sleepMs(1500)
-                exitStep = 3
-            }
-            else -> {
-                LogStore.add("FLOW", "room se bahar — agle banner ka wait")
-                setState(State.WATCHING)
-            }
-        }
+        private const val TIPS_OK_X = 0.75f
+        private const val TIPS_OK_Y = 0.60f
+
+        private const val BANNER_THROTTLE_MS = 6000L
     }
 }
