@@ -62,42 +62,56 @@ object VisualDetection {
     data class TopBannerResult(
         val present: Boolean,
         val redRatio: Float,
+        val warmRatio: Float,
         val tapX: Int,
         val tapY: Int
     )
 
     /**
-     * Scan the top strip (below the status bar) for the scrolling red banner.
-     * The banner is a thin red band, so the strip is kept thin and also
-     * analysed in horizontal segments — the tap lands on the reddest segment.
+     * Scan the banner band for the scrolling red-envelope banner.
+     *
+     * Measured from a real screen recording (2026-10-21): the banner rides at
+     * 0.095–0.175 of screen height (over the Balance row). Its ribbon is TRUE
+     * red (strict rule matches 0.14–0.19 of the band), while the look-alike
+     * gift/avatar banners are ORANGE (strict red only 0.03–0.04, warm 0.12).
+     * So: envelope = strict red >= 0.09. The tap lands on the centroid of the
+     * red pixels, which tracks the banner as it scrolls.
      */
     fun analyzeTopBanner(bmp: Bitmap): TopBannerResult {
         val w = bmp.width
         val h = bmp.height
-        val top = (h * 0.05f).toInt()
-        val bottom = (h * 0.15f).toInt()
-        val overall = ratios(bmp, (w * 0.04f).toInt(), top, (w * 0.96f).toInt(), bottom)
-
-        val segments = 8
-        val segW = w / segments
-        var bestSeg = -1
-        var bestRatio = 0f
-        for (i in 0 until segments) {
-            val seg = ratios(bmp, i * segW, top, (i + 1) * segW, bottom)
-            if (seg.first > bestRatio) {
-                bestRatio = seg.first
-                bestSeg = i
+        val top = (h * 0.095f).toInt()
+        val bottom = (h * 0.175f).toInt()
+        val left = (w * 0.03f).toInt()
+        val right = (w * 0.97f).toInt()
+        var total = 0
+        var red = 0
+        var warm = 0
+        var redXSum = 0L
+        var y = top
+        while (y < bottom) {
+            var x = left
+            while (x < right) {
+                val p = bmp.getPixel(x, y)
+                val rr = (p shr 16) and 255
+                val gg = (p shr 8) and 255
+                val bb = p and 255
+                total++
+                if (rr > 140 && gg < 80 && bb < 90) {
+                    red++
+                    redXSum += x
+                } else if (rr > 150 && gg in 60..170 && bb < 130 && rr - bb > 70) {
+                    warm++
+                }
+                x += 3
             }
+            y += 3
         }
-
-        val present = overall.first >= 0.13f || bestRatio >= 0.40f
-        val tapX = if (bestSeg >= 0) (bestSeg * segW + segW / 2) else w / 2
-        return TopBannerResult(
-            present = present,
-            redRatio = maxOf(overall.first, bestRatio),
-            tapX = tapX,
-            tapY = (top + bottom) / 2
-        )
+        val redRatio = if (total == 0) 0f else red.toFloat() / total
+        val warmRatio = if (total == 0) 0f else warm.toFloat() / total
+        val present = redRatio >= 0.09f
+        val tapX = if (red > 0) (redXSum / red).toInt() else w / 2
+        return TopBannerResult(present, redRatio, warmRatio, tapX, (top + bottom) / 2)
     }
 
     /** Returns (redRatio, goldRatio) for a region, sampling every 3rd pixel. */
