@@ -19,6 +19,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 
+/**
+ * Yo2 Hunter v2 — automation engine.
+ *
+ * Detection: accessibility text nodes (old app's proven approach, ~350 ms scan)
+ * with a screenshot colour fallback. Flow per YO2-HUNTER spec:
+ * banner → Tips OK → room popup → DIRECT tap Open / COUNTDOWN fast-tap
+ * (a direct banner always preempts countdown tapping) → verify → exit flow.
+ */
 class AutomationAccessibilityService : AccessibilityService() {
 
     private lateinit var prefs: AppPreferences
@@ -32,9 +40,13 @@ class AutomationAccessibilityService : AccessibilityService() {
     private var flowRunning = false
 
     private var currentPackage: String = ""
-    private var visualCycleCount = 0
+    private var cycleCount = 0
     private var lastScreenshotMs = 0L
     private var lastBannerTapMs = 0L
+    private var lastVisualMs = 0L
+
+    @Volatile
+    private var visualBusy = false
 
     private val stateListener: () -> Unit = {
         overlayManager?.refresh()
@@ -77,7 +89,9 @@ class AutomationAccessibilityService : AccessibilityService() {
         if (pkg == packageName.lowercase()) return
         currentPackage = pkg
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-        if (pkg.contains("systemui") || pkg.contains("inputmethod") || pkg.contains("launcher")) return
+        // Transient system/search windows must not pause the automation —
+        // they come and go while the user is still inside Yo2.
+        if (IGNORE_PACKAGES.any { pkg.contains(it) }) return
 
         val isYo2Active = prefs.getTargetPackagesList().any { pkg.contains(it) }
         if (isYo2Active) {
@@ -106,6 +120,8 @@ class AutomationAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
+    // ------------------------------------------------------------------ loop
+
     private fun startScanLoop() {
         loopJob?.cancel()
         loopJob = serviceScope.launch {
@@ -115,6 +131,7 @@ class AutomationAccessibilityService : AccessibilityService() {
                         processScreenCycle()
                     }
                 } catch (e: Exception) {
+                    // a bad cycle must never kill the loop
                 }
                 delay(prefs.scanIntervalMs.coerceIn(120L, 2000L))
             }
@@ -150,21 +167,51 @@ class AutomationAccessibilityService : AccessibilityService() {
             return
         }
 
-        visualCycleCount++
-        if (visualCycleCount % 4 == 0 && now - lastBannerTapMs > BANNER_THROTTLE_MS) {
-            val bmp = captureScreen() ?: return
-            try {
-                val tb = VisualDetection.analyzeTopBanner(bmp)
-                if (tb.present) {
-                    lastBannerTapMs = now
-                    AutomationStateMachine.onEnvelopeDetected("visual banner red=${"%.2f".format(tb.redRatio)}")
-                    startRoomFlow(null, tb.tapX, tb.tapY)
+        // Periodic scan summary — shows exactly what the app can see.
+        cycleCount++
+        if (cycleCount % 30 == 0) {
+            val texts = TargetDetection.collectTexts(root)
+            val sample = texts.take(3).joinToString(" | ") { it.take(22) }
+            AutomationStateMachine.addLog("SCAN texts=${texts.size} [$sample]", "INFO")
+        }
+
+        // Visual fallback for the top banner — runs in its own coroutine so a
+        // slow screenshot never blocks the fast node scans.
+        if (now - lastVisualMs > 2200 && now - lastBannerTapMs > BANNER_THROTTLE_MS && !visualBusy) {
+            lastVisualMs = now
+            visualBusy = true
+            serviceScope.launch {
+                try {
+                    val bmp = captureScreen()
+                    if (bmp != null) {
+                        try {
+                            val tb = VisualDetection.analyzeTopBanner(bmp)
+                            if (tb.redRatio >= 0.05f || tb.present) {
+                                AutomationStateMachine.addLog(
+                                    "VIS red=${"%.2f".format(tb.redRatio)} present=${tb.present}", "INFO"
+                                )
+                            }
+                            if (tb.present && !flowRunning) {
+                                lastBannerTapMs = System.currentTimeMillis()
+                                AutomationStateMachine.onEnvelopeDetected(
+                                    "visual banner red=${"%.2f".format(tb.redRatio)}"
+                                )
+                                startRoomFlow(null, tb.tapX, tb.tapY)
+                            }
+                        } finally {
+                            bmp.recycle()
+                        }
+                    }
+                } catch (e: Exception) {
+                    // visual check is best-effort
+                } finally {
+                    visualBusy = false
                 }
-            } finally {
-                bmp.recycle()
             }
         }
     }
+
+    // ------------------------------------------------------------------ flow
 
     private fun startRoomFlow(
         banner: TargetDetection.IdentifiedTarget?,
@@ -190,6 +237,7 @@ class AutomationAccessibilityService : AccessibilityService() {
         visualTapX: Int?,
         visualTapY: Int?
     ) {
+        // 1) Tap the banner.
         if (banner != null) {
             tapTarget(banner)
         } else if (visualTapX != null && visualTapY != null) {
@@ -197,8 +245,10 @@ class AutomationAccessibilityService : AccessibilityService() {
         }
         delay(900)
 
+        // 2) Tips dialog → OK.
         handleTipsDialog()
 
+        // 3) Classify the room popup: DIRECT vs COUNTDOWN.
         var enteredRoom = false
         var openBtn: TargetDetection.IdentifiedTarget? = null
         var countdown: TargetDetection.IdentifiedTarget? = null
@@ -243,6 +293,7 @@ class AutomationAccessibilityService : AccessibilityService() {
             return
         }
 
+        // 4a) DIRECT — tap Open now.
         if (openBtn != null || visualReady != null) {
             AutomationStateMachine.addLog("Direct envelope — tapping Open", "FLOW")
             if (openBtn != null) tapTarget(openBtn) else tapPoint(OPEN_X, OPEN_Y)
@@ -250,6 +301,7 @@ class AutomationAccessibilityService : AccessibilityService() {
             return
         }
 
+        // 4b) COUNTDOWN — fast-tap until Open appears.
         val cdSeconds = countdown?.countdownSeconds
         AutomationStateMachine.onCountdownRunning(cdSeconds)
         val tapDeadline = System.currentTimeMillis() +
@@ -263,16 +315,19 @@ class AutomationAccessibilityService : AccessibilityService() {
                 prefs.getOpenKeywordsList(),
                 prefs.getSuccessKeywordsList()
             )
+            // Open appeared — claim it.
             val nowOpen = targets.firstOrNull { it.targetType == TargetDetection.TargetType.OPEN_BUTTON }
             if (nowOpen != null) {
                 tapTarget(nowOpen)
                 verifyClaim(enteredRoom = true)
                 return
             }
+            // Confirmation already visible (someone/something claimed it).
             if (targets.any { isRealConfirmation(it) }) {
                 verifyClaim(enteredRoom = true)
                 return
             }
+            // PRIORITY RULE: a fresh direct banner preempts countdown tapping.
             val now = System.currentTimeMillis()
             val freshBanner = targets.firstOrNull { it.targetType == TargetDetection.TargetType.FLOATING_ENVELOPE }
             if (freshBanner != null && now - lastPreemptTapMs > 2500) {
@@ -281,6 +336,7 @@ class AutomationAccessibilityService : AccessibilityService() {
                 tapTarget(freshBanner)
                 delay(900)
                 handleTipsDialog()
+                // After the detour, the new room may be direct-open:
                 val root2 = rootInActiveWindow
                 val targets2 = TargetDetection.scanScreen(
                     root2,
@@ -295,6 +351,7 @@ class AutomationAccessibilityService : AccessibilityService() {
                     return
                 }
             }
+            // Fast-tap the countdown label (fresh bounds each cycle).
             val cdNow = targets.firstOrNull { it.targetType == TargetDetection.TargetType.COUNTDOWN_LABEL }
             if (cdNow != null) {
                 tapXY(cdNow.bounds.centerX(), cdNow.bounds.centerY())
@@ -361,6 +418,7 @@ class AutomationAccessibilityService : AccessibilityService() {
                 if (enteredRoom) exitFlow()
                 return
             }
+            // Popup still open — re-tap Open a few times.
             val now = System.currentTimeMillis()
             val openBtn = targets.firstOrNull { it.targetType == TargetDetection.TargetType.OPEN_BUTTON }
             if (openBtn != null && openRetries < prefs.maxRetries && now - lastRetryMs > 2000) {
@@ -382,6 +440,7 @@ class AutomationAccessibilityService : AccessibilityService() {
             s.contains("deposited into your account")
     }
 
+    /** The success screen shows a big coin number — grab the largest plausible one for the log. */
     private fun extractCoins(root: AccessibilityNodeInfo?): Int? {
         val texts = TargetDetection.collectTexts(root)
         var best: Int? = null
@@ -394,6 +453,7 @@ class AutomationAccessibilityService : AccessibilityService() {
         return best
     }
 
+    /** Exit flow — X under the envelope → power → lower Exit bubble. Never linger. */
     private suspend fun exitFlow() {
         tapPoint(CLOSE_X, CLOSE_Y)
         delay(750)
@@ -404,6 +464,8 @@ class AutomationAccessibilityService : AccessibilityService() {
         AutomationStateMachine.addLog("Exit flow done — waiting for next banner", "FLOW")
         delay(prefs.cooldownMs)
     }
+
+    // ------------------------------------------------------------------ taps
 
     private suspend fun tapTarget(target: TargetDetection.IdentifiedTarget) {
         val clickable = TargetDetection.findClickableNode(target.node)
@@ -438,6 +500,8 @@ class AutomationAccessibilityService : AccessibilityService() {
         }, null)
         if (!dispatched && cont.isActive) cont.resume(false)
     }
+
+    // ------------------------------------------------------------- screenshot
 
     private suspend fun captureScreen(): Bitmap? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
@@ -474,6 +538,7 @@ class AutomationAccessibilityService : AccessibilityService() {
         var isServiceConnected: Boolean = false
             private set
 
+        // Fixed tap points (fractions) — from the proven old app.
         private const val OPEN_X = 0.5f
         private const val OPEN_Y = 0.62f
         private const val CLOSE_X = 0.5f
@@ -483,9 +548,16 @@ class AutomationAccessibilityService : AccessibilityService() {
         private const val EXIT_X = 0.5f
         private const val EXIT_Y = 0.607f
 
+        // Tips dialog OK (YO2-HUNTER spec).
         private const val TIPS_OK_X = 0.75f
         private const val TIPS_OK_Y = 0.60f
 
         private const val BANNER_THROTTLE_MS = 6000L
+
+        // Windows that appear briefly over other apps and must never pause us.
+        private val IGNORE_PACKAGES = listOf(
+            "systemui", "inputmethod", "launcher",
+            "googlequicksearchbox", "permissioncontroller", "android.gms"
+        )
     }
 }
