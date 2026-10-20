@@ -3,6 +3,7 @@ package com.yo2.autoclaim
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.provider.Settings
 import android.view.Gravity
@@ -13,104 +14,145 @@ import android.widget.LinearLayout
 import android.widget.TextView
 
 /**
- * Floating overlay: ON/OFF toggle + live counters.
- * Draggable. Tapping toggles automation on/off.
+ * Small floating overlay: status, counters, STOP button. Draggable.
+ * Built with plain views (same job as the old app's overlay).
  */
-object OverlayManager {
+class OverlayManager(private val context: Context) {
 
-    private var wm: WindowManager? = null
-    private var view: View? = null
-    private var statusTv: TextView? = null
-    private var countersTv: TextView? = null
-    private var appCtx: Context? = null
+    private var windowManager: WindowManager? = null
+    private var rootView: LinearLayout? = null
+    private var statusText: TextView? = null
+    private var countersText: TextView? = null
+    private var params: WindowManager.LayoutParams? = null
+    private var shown = false
 
-    fun hasPermission(ctx: Context): Boolean =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) Settings.canDrawOverlays(ctx) else true
+    fun canDraw(): Boolean = Settings.canDrawOverlays(context)
 
-    @Synchronized
-    fun init(ctx: Context) {
-        if (view != null) return
-        appCtx = ctx.applicationContext
-        if (!hasPermission(appCtx!!)) return
+    fun show() {
+        if (shown || !canDraw()) return
         try {
-            wm = appCtx!!.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
-            val layout = LinearLayout(appCtx).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.argb(210, 20, 20, 28))
-                setPadding(18, 14, 18, 14)
+            val bg = GradientDrawable().apply {
+                setColor(Color.parseColor("#E6121B2E"))
+                cornerRadius = 28f
+                setStroke(2, Color.parseColor("#E11D48"))
             }
-            statusTv = TextView(appCtx).apply {
-                textSize = 15f
+
+            val title = TextView(context).apply {
+                text = "Yo2 Auto-Claim"
                 setTextColor(Color.WHITE)
-            }
-            countersTv = TextView(appCtx).apply {
                 textSize = 12f
-                setTextColor(Color.argb(255, 255, 210, 130))
+                setPadding(24, 10, 24, 0)
             }
-            layout.addView(statusTv)
-            layout.addView(countersTv)
+            statusText = TextView(context).apply {
+                text = "SERVICE IDLE"
+                setTextColor(Color.parseColor("#FBBF24"))
+                textSize = 11f
+                setPadding(24, 2, 24, 0)
+            }
+            countersText = TextView(context).apply {
+                text = "Claimed: 0   Failed: 0"
+                setTextColor(Color.parseColor("#CBD5E1"))
+                textSize = 11f
+                setPadding(24, 2, 24, 4)
+            }
+            val stopBtn = TextView(context).apply {
+                text = "STOP"
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                gravity = Gravity.CENTER
+                setPadding(24, 8, 24, 14)
+                setOnClickListener {
+                    AutomationStateMachine.addLog("Stopped from floating overlay", "STOP")
+                    AutomationStateMachine.stop("overlay stop")
+                }
+            }
 
-            val params = WindowManager.LayoutParams(
+            rootView = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                background = bg
+                addView(title)
+                addView(statusText)
+                addView(countersText)
+                addView(stopBtn)
+            }
+
+            val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else
+                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+            params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT
             ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                x = 20; y = 220
+                gravity = Gravity.TOP or Gravity.END
+                x = 24
+                y = 140
             }
 
-            // drag to move; tap to toggle on/off
-            var downX = 0f; var downY = 0f; var moved = false
-            var startX = 0; var startY = 0
-            layout.setOnTouchListener { _, e ->
-                when (e.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        downX = e.rawX; downY = e.rawY
-                        startX = params.x; startY = params.y; moved = false
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        val dx = (e.rawX - downX).toInt()
-                        val dy = (e.rawY - downY).toInt()
-                        if (dx * dx + dy * dy > 100) moved = true
-                        params.x = startX + dx; params.y = startY + dy
-                        try { wm?.updateViewLayout(layout, params) } catch (_: Exception) {}
-                    }
-                    MotionEvent.ACTION_UP -> {
-                        if (!moved) toggleFromOverlay()
-                    }
-                }
-                true
-            }
-
-            wm?.addView(layout, params)
-            view = layout
+            attachDrag(rootView!!, params!!)
+            windowManager?.addView(rootView, params)
+            shown = true
             refresh()
         } catch (e: Exception) {
-            LogStore.add("OVERLAY", "show failed: ${e.message}")
+            shown = false
         }
     }
 
-    private fun toggleFromOverlay() {
-        Prefs.enabled = !Prefs.enabled
-        LogStore.add("OVERLAY", if (Prefs.enabled) "ON (overlay se)" else "OFF (overlay se)")
-        refresh()
+    fun dismiss() {
+        if (!shown) return
+        try {
+            rootView?.let { windowManager?.removeView(it) }
+        } catch (e: Exception) {
+        }
+        rootView = null
+        shown = false
     }
 
-    @Synchronized
     fun refresh() {
-        val on = Prefs.enabled
-        statusTv?.text = if (on) "● Yo2 AC: ON" else "○ Yo2 AC: OFF"
-        statusTv?.setTextColor(if (on) Color.argb(255, 120, 255, 140) else Color.WHITE)
-        countersTv?.text =
-            "D:${Prefs.detected} ✓:${Prefs.claimedDirect + Prefs.claimedCountdown} 🪙:${Prefs.coins} ✗:${Prefs.expired}"
+        if (!shown) return
+        val stats = AutomationStateMachine.getStats()
+        val state = AutomationStateMachine.currentState
+        rootView?.post {
+            statusText?.text = when {
+                !AutomationStateMachine.isRunning() -> "SERVICE IDLE"
+                state == AutomationState.PAUSED -> "PAUSED"
+                else -> "SERVICE RUNNING"
+            }
+            countersText?.text = "Claimed: ${stats.claimed}   Failed: ${stats.failed}"
+        }
     }
 
-    @Synchronized
-    fun hide() {
-        try { view?.let { wm?.removeView(it) } } catch (_: Exception) {}
-        view = null; wm = null; statusTv = null; countersTv = null
+    private fun attachDrag(view: View, lp: WindowManager.LayoutParams) {
+        var startX = 0
+        var startY = 0
+        var touchX = 0f
+        var touchY = 0f
+        view.setOnTouchListener { v, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    startX = lp.x
+                    startY = lp.y
+                    touchX = event.rawX
+                    touchY = event.rawY
+                    false
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    lp.x = startX + (event.rawX - touchX).toInt()
+                    lp.y = startY + (event.rawY - touchY).toInt()
+                    try {
+                        windowManager?.updateViewLayout(v, lp)
+                    } catch (e: Exception) {
+                    }
+                    false
+                }
+                else -> false
+            }
+        }
     }
 }
