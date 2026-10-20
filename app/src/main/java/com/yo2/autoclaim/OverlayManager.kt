@@ -90,7 +90,7 @@ class OverlayManager(private val context: Context) {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT
             ).apply {
-                gravity = Gravity.TOP or Gravity.END
+                gravity = Gravity.TOP or Gravity.START
                 x = 24
                 y = 140
             }
@@ -109,6 +109,7 @@ class OverlayManager(private val context: Context) {
         try {
             rootView?.let { windowManager?.removeView(it) }
         } catch (e: Exception) {
+            // already detached
         }
         rootView = null
         shown = false
@@ -140,7 +141,7 @@ class OverlayManager(private val context: Context) {
                     startY = lp.y
                     touchX = event.rawX
                     touchY = event.rawY
-                    false
+                    true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     lp.x = startX + (event.rawX - touchX).toInt()
@@ -148,8 +149,9 @@ class OverlayManager(private val context: Context) {
                     try {
                         windowManager?.updateViewLayout(v, lp)
                     } catch (e: Exception) {
+                        // view detached
                     }
-                    false
+                    true
                 }
                 else -> false
             }
