@@ -30,8 +30,12 @@ object TargetDetection {
     private val countdownPatternMinutesSeconds: Pattern = Pattern.compile("(\\d{1,2}):(\\d{2})")
     private val countdownPatternSeconds: Pattern = Pattern.compile("(\\d{1,3})\\s*(?:s|sec|秒)")
 
+    // Tokens that always mark an envelope, whatever the user's keyword list says
+    // (the banner writes the multiplier with a "×" sign, not the letter "x").
+    private val ALWAYS_ENVELOPE_TOKENS = listOf("×9999", "×39999", "×99999", "lucky money")
+
     private val failedTexts = listOf(
-        "received completely",
+        "received completely", // NOTE: this phrase means empty-but-shown; handled by caller context
         "too late", "already finished", "has been received", "抢光了", "已抢完", "no more"
     )
 
@@ -58,24 +62,41 @@ object TargetDetection {
         if (rootNode == null) return emptyList()
         val results = ArrayList<IdentifiedTarget>()
         traverseNodes(rootNode) { node ->
+            val viewId = node.viewIdResourceName?.lowercase().orEmpty()
+            if (viewId.contains("envelope") || viewId.contains("redpacket") ||
+                viewId.contains("red_packet") || viewId.contains("hongbao")
+            ) {
+                val bounds = Rect()
+                node.getBoundsInScreen(bounds)
+                if (bounds.width() > 0 && bounds.height() > 0) {
+                    results.add(
+                        IdentifiedTarget(node, bounds, TargetType.FLOATING_ENVELOPE, "viewId:$viewId")
+                    )
+                }
+            }
             val text = nodeText(node)
             if (text.isNotEmpty()) {
                 val lower = text.lowercase()
                 val bounds = Rect()
                 node.getBoundsInScreen(bounds)
                 when {
+                    // Claim confirmation — strongest signal, checked first.
                     lower.contains("received completely") || lower.contains("lucky money has been received") -> {
                         results.add(IdentifiedTarget(node, bounds, TargetType.CLAIM_CONFIRMATION, text))
                     }
                     successKeywords.any { lower.contains(it) } && bounds.top > 0 -> {
+                        // Success keywords alone are weak (they appear in history lists too);
+                        // the service confirms them only inside a claim flow.
                         results.add(IdentifiedTarget(node, bounds, TargetType.CLAIM_CONFIRMATION, text))
                     }
                     failedTexts.any { lower.contains(it) } && !lower.contains("received completely") -> {
                         results.add(IdentifiedTarget(node, bounds, TargetType.CLAIM_FAILED_LABEL, text))
                     }
+                    // Open button: exact-ish match on a short label.
                     openKeywords.any { lower == it || (lower.length <= 14 && lower.contains(it)) } -> {
                         results.add(IdentifiedTarget(node, bounds, TargetType.OPEN_BUTTON, text))
                     }
+                    // Countdown label: a timer with MM:SS or "NN s".
                     parseCountdownSeconds(text) != null && text.length <= 12 -> {
                         results.add(
                             IdentifiedTarget(
@@ -84,7 +105,9 @@ object TargetDetection {
                             )
                         )
                     }
-                    envelopeKeywords.any { lower.contains(it) } -> {
+                    // Floating banner / envelope entry.
+                    envelopeKeywords.any { lower.contains(it) } ||
+                        ALWAYS_ENVELOPE_TOKENS.any { lower.contains(it) } -> {
                         results.add(IdentifiedTarget(node, bounds, TargetType.FLOATING_ENVELOPE, text))
                     }
                 }
@@ -93,6 +116,7 @@ object TargetDetection {
         return results
     }
 
+    /** Collect every visible text on screen (for Tips dialog checks etc.). */
     fun collectTexts(rootNode: AccessibilityNodeInfo?): List<String> {
         if (rootNode == null) return emptyList()
         val out = ArrayList<String>()
@@ -108,6 +132,7 @@ object TargetDetection {
         return texts.any { t -> needles.any { n -> t.contains(n, ignoreCase = true) } }
     }
 
+    /** Find a node whose text matches one of the needles (exact or contains). */
     fun findNodeByText(rootNode: AccessibilityNodeInfo?, needles: List<String>): IdentifiedTarget? {
         if (rootNode == null) return null
         var found: IdentifiedTarget? = null
