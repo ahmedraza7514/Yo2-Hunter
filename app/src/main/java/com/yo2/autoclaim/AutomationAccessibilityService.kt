@@ -177,7 +177,7 @@ class AutomationAccessibilityService : AccessibilityService() {
 
         // Visual fallback for the top banner — runs in its own coroutine so a
         // slow screenshot never blocks the fast node scans.
-        if (now - lastVisualMs > 2200 && now - lastBannerTapMs > BANNER_THROTTLE_MS && !visualBusy) {
+        if (now - lastVisualMs > 1100 && now - lastBannerTapMs > BANNER_THROTTLE_MS && !visualBusy) {
             lastVisualMs = now
             visualBusy = true
             serviceScope.launch {
@@ -186,9 +186,10 @@ class AutomationAccessibilityService : AccessibilityService() {
                     if (bmp != null) {
                         try {
                             val tb = VisualDetection.analyzeTopBanner(bmp)
-                            if (tb.redRatio >= 0.05f || tb.present) {
+                            if (tb.redRatio >= 0.03f || tb.warmRatio >= 0.05f || tb.present) {
                                 AutomationStateMachine.addLog(
-                                    "VIS red=${"%.2f".format(tb.redRatio)} present=${tb.present}", "INFO"
+                                    "VIS red=${"%.2f".format(tb.redRatio)} warm=${"%.2f".format(tb.warmRatio)} present=${tb.present}",
+                                    "INFO"
                                 )
                             }
                             if (tb.present && !flowRunning) {
