@@ -123,9 +123,13 @@ class AutomationAccessibilityService : AccessibilityService() {
                 object : AccessibilityService.TakeScreenshotCallback {
     override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
                         try {
-                            val hw = result.hardwareBitmap
-                            out = hw.copy(Bitmap.Config.ARGB_8888, false)
-                            hw.recycle()
+                           val buffer = result.hardwareBuffer
+val wrapped = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace)
+if (wrapped != null) {
+    out = wrapped.copy(Bitmap.Config.ARGB_8888, false)
+    wrapped.recycle()
+}
+buffer.close()
                         } catch (_: Exception) {}
                         latch.countDown()
                     }
