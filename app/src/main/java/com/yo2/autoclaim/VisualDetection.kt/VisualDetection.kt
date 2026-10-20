@@ -68,19 +68,34 @@ object VisualDetection {
 
     /**
      * Scan the top strip (below the status bar) for the scrolling red banner.
-     * The banner is one wide red view — tapping its centre is enough.
+     * The banner is a thin red band, so the strip is kept thin and also
+     * analysed in horizontal segments — the tap lands on the reddest segment.
      */
     fun analyzeTopBanner(bmp: Bitmap): TopBannerResult {
         val w = bmp.width
         val h = bmp.height
-        val top = (h * 0.055f).toInt()
-        val bottom = (h * 0.17f).toInt()
-        val strip = ratios(bmp, (w * 0.06f).toInt(), top, (w * 0.94f).toInt(), bottom)
-        val present = strip.first >= 0.28f
+        val top = (h * 0.05f).toInt()
+        val bottom = (h * 0.15f).toInt()
+        val overall = ratios(bmp, (w * 0.04f).toInt(), top, (w * 0.96f).toInt(), bottom)
+
+        val segments = 8
+        val segW = w / segments
+        var bestSeg = -1
+        var bestRatio = 0f
+        for (i in 0 until segments) {
+            val seg = ratios(bmp, i * segW, top, (i + 1) * segW, bottom)
+            if (seg.first > bestRatio) {
+                bestRatio = seg.first
+                bestSeg = i
+            }
+        }
+
+        val present = overall.first >= 0.13f || bestRatio >= 0.40f
+        val tapX = if (bestSeg >= 0) (bestSeg * segW + segW / 2) else w / 2
         return TopBannerResult(
             present = present,
-            redRatio = strip.first,
-            tapX = w / 2,
+            redRatio = maxOf(overall.first, bestRatio),
+            tapX = tapX,
             tapY = (top + bottom) / 2
         )
     }
