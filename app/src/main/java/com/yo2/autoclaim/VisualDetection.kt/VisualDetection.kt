@@ -114,6 +114,87 @@ object VisualDetection {
         return TopBannerResult(present, redRatio, warmRatio, tapX, (top + bottom) / 2)
     }
 
+    /** Which kind of envelope a floating banner carries. */
+    enum class BannerKind { DIRECT, COUNTDOWN, UNKNOWN }
+
+    /**
+     * Classify a floating banner as DIRECT or COUNTDOWN from its icon.
+     *
+     * The two banners differ only in the medallion at the ribbon's left end
+     * (Ahmed Bhai's reference screenshots, 2026-10-21): DIRECT carries one
+     * red purse — the medallion centre is solid red; COUNTDOWN carries a
+     * golden hourglass flanked by two small purses — the centre is gold.
+     *
+     * Measured on 8 real video frames: in the medallion-centre window
+     * (red-extent left edge + 0.025w .. + 0.10w, shares over warm pixels)
+     * every DIRECT banner read red >= 0.68 and gold <= 0.26, while every
+     * COUNTDOWN banner failed at least one side of that test (red as low as
+     * 0.27, gold as high as 0.62). A banner whose red extent is narrower
+     * than 0.45w is not fully on screen yet, so it stays UNKNOWN — the
+     * caller re-checks on the next pass while it crosses.
+     */
+    fun classifyBanner(bmp: Bitmap): BannerKind {
+        val w = bmp.width
+        val h = bmp.height
+        val top = (h * 0.095f).toInt()
+        val bottom = (h * 0.185f).toInt()
+        // Pass 1: strict-red extent of the ribbon in the banner band.
+        var leftEdge = Int.MAX_VALUE
+        var rightEdge = Int.MIN_VALUE
+        var y = top
+        while (y < bottom) {
+            var x = 0
+            while (x < w) {
+                val p = bmp.getPixel(x, y)
+                val rr = (p shr 16) and 255
+                val gg = (p shr 8) and 255
+                val bb = p and 255
+                if (rr > 140 && gg < 80 && bb < 90) {
+                    if (x < leftEdge) leftEdge = x
+                    if (x > rightEdge) rightEdge = x
+                }
+                x += 2
+            }
+            y += 2
+        }
+        if (rightEdge == Int.MIN_VALUE) return BannerKind.UNKNOWN
+        if (rightEdge - leftEdge < (w * 0.45f).toInt()) return BannerKind.UNKNOWN
+        // Pass 2: warm-colour shares in the medallion-centre window.
+        val x0 = leftEdge + (w * 0.025f).toInt()
+        val x1 = leftEdge + (w * 0.10f).toInt()
+        var warm = 0
+        var red = 0
+        var gold = 0
+        y = top
+        while (y < bottom) {
+            var x = x0
+            while (x < x1 && x < w) {
+                val p = bmp.getPixel(x, y)
+                val rr = (p shr 16) and 255
+                val gg = (p shr 8) and 255
+                val bb = p and 255
+                val isRed = rr > 140 && gg < 80 && bb < 90
+                val isGold = rr > 170 && gg > 125 && bb < 130 && rr - bb >= 60
+                val isCream = rr > 195 && gg > 170 && bb > 125 && (rr - bb) in 30..95
+                if (isRed || isGold || isCream) {
+                    warm++
+                    if (isRed) red++
+                    if (isGold) gold++
+                }
+                x += 2
+            }
+            y += 2
+        }
+        if (warm < 30) return BannerKind.UNKNOWN
+        val redShare = red.toFloat() / warm
+        val goldShare = gold.toFloat() / warm
+        return when {
+            redShare >= 0.55f && goldShare <= 0.30f -> BannerKind.DIRECT
+            goldShare >= 0.40f -> BannerKind.COUNTDOWN
+            else -> BannerKind.UNKNOWN
+        }
+    }
+
     /**
      * Strict-red ratio over the central card region. The claim RESULT screen
      * ("Deposited into your account / Received x/x") is one big red card —
