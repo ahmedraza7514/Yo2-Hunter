@@ -87,7 +87,7 @@ private fun MainScreen(activity: MainActivity) {
             tick++
         }
     }
-    @Suppress("UNUSED_EXPRESSION") tick
+    @Suppress("UNUSED_EXPRESSION") tick // drives recomposition
 
     val running = AutomationStateMachine.isRunning()
     val state = AutomationStateMachine.currentState
@@ -108,6 +108,7 @@ private fun MainScreen(activity: MainActivity) {
             .verticalScroll(rememberScrollState())
             .padding(16.dp)
     ) {
+        // Header
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
@@ -134,6 +135,7 @@ private fun MainScreen(activity: MainActivity) {
 
         Spacer(modifier = Modifier.height(12.dp))
 
+        // Status pill
         val statusText = when {
             !running -> "SERVICE IDLE"
             state == AutomationState.PAUSED -> "PAUSED"
@@ -148,6 +150,7 @@ private fun MainScreen(activity: MainActivity) {
 
         Spacer(modifier = Modifier.height(12.dp))
 
+        // Start / Stop
         if (!running) {
             Button(
                 onClick = { ForegroundAutomationService.start(context) },
@@ -167,6 +170,7 @@ private fun MainScreen(activity: MainActivity) {
 
         Spacer(modifier = Modifier.height(16.dp))
 
+        // Stats
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             StatCard("Claimed", stats.claimed.toString(), Modifier.weight(1f))
             StatCard("Failed / Missed", stats.failed.toString(), Modifier.weight(1f))
@@ -181,9 +185,16 @@ private fun MainScreen(activity: MainActivity) {
                 Modifier.weight(1f)
             )
         }
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            OutlinedButton(onClick = { AutomationStateMachine.resetStats() }) {
+                Text("Reset Counters", fontSize = 12.sp)
+            }
+        }
 
         Spacer(modifier = Modifier.height(16.dp))
 
+        // Permissions
         Text("Permissions", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
         Spacer(modifier = Modifier.height(8.dp))
         PermissionRow("Accessibility Service", a11yEnabled) {
@@ -211,7 +222,14 @@ private fun MainScreen(activity: MainActivity) {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        Text("Live Activity Logs", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+        // Logs
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Live Activity Logs", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.weight(1f))
+            OutlinedButton(onClick = { AutomationStateMachine.clearLogs() }) {
+                Text("Clear Logs", fontSize = 12.sp)
+            }
+        }
         Spacer(modifier = Modifier.height(8.dp))
         Card(
             colors = CardDefaults.cardColors(containerColor = CardColor),
@@ -409,5 +427,6 @@ private fun isBatteryIgnored(context: Context): Boolean {
     }
 }
 
+// Kept for API parity with the old app (foreground service type on newer APIs).
 @Suppress("unused")
 private fun isAtLeastApi34(): Boolean = Build.VERSION.SDK_INT >= 34
