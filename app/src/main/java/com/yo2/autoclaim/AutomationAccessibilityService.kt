@@ -18,6 +18,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 
 /**
@@ -48,6 +49,22 @@ class AutomationAccessibilityService : AccessibilityService() {
 
     @Volatile
     private var visualBusy = false
+
+    // Idle-visual health (2026-10-21 post-mortem): a whole session ran with
+    // the node scan alive but ZERO visual checks — one hung screenshot had
+    // latched visualBusy forever and the canvas banner crossed unseen.
+    // These fields let the watchdog free a stuck latch and let the SCAN
+    // summary line show the last visual reading (or that none ever came).
+    private var visualBusySinceMs = 0L
+
+    @Volatile
+    private var lastVisRed = -1f
+
+    @Volatile
+    private var lastVisWarm = -1f
+
+    @Volatile
+    private var visFailStreak = 0
 
     // Last screen luminance measured by the exit flow's bubble check —
     // logged when the power tap seems to miss, so the log shows whether
@@ -173,12 +190,24 @@ class AutomationAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Periodic scan summary — shows exactly what the app can see.
+        // Periodic scan summary — shows exactly what the app can see,
+        // including the last visual reading (vis=-1 = no screenshot yet).
         cycleCount++
         if (cycleCount % 30 == 0) {
             val texts = TargetDetection.collectTexts(root)
             val sample = texts.take(3).joinToString(" | ") { it.take(22) }
-            AutomationStateMachine.addLog("SCAN texts=${texts.size} [$sample]", "INFO")
+            val vis = if (lastVisRed < 0f) "vis=-1" else
+                "vis=${"%.2f".format(lastVisRed)}/${"%.2f".format(lastVisWarm)}"
+            AutomationStateMachine.addLog("SCAN texts=${texts.size} $vis [$sample]", "INFO")
+        }
+
+        // Watchdog: if a screenshot hangs, its coroutine never finishes and
+        // visualBusy would stay latched forever (happened live 2026-10-21 —
+        // a full session with zero visual checks while a banner crossed).
+        // Free the latch after 4s; the capture timeout does the rest.
+        if (visualBusy && now - visualBusySinceMs > 4000) {
+            visualBusy = false
+            AutomationStateMachine.addLog("VIS watchdog — stuck screenshot check reset", "WARN")
         }
 
         // Visual fallback for the top banner — runs in its own coroutine so a
@@ -186,12 +215,25 @@ class AutomationAccessibilityService : AccessibilityService() {
         if (now - lastVisualMs > 800 && now - lastBannerTapMs > BANNER_THROTTLE_MS && !visualBusy) {
             lastVisualMs = now
             visualBusy = true
+            visualBusySinceMs = now
             serviceScope.launch {
                 try {
                     val bmp = captureScreen()
+                    if (bmp == null) {
+                        visFailStreak++
+                        if (visFailStreak == 3) {
+                            AutomationStateMachine.addLog(
+                                "VIS screenshot not coming (x3) — this screen may block screenshots",
+                                "WARN"
+                            )
+                        }
+                    }
                     if (bmp != null) {
+                        visFailStreak = 0
                         try {
                             val tb = VisualDetection.analyzeTopBanner(bmp)
+                            lastVisRed = tb.redRatio
+                            lastVisWarm = tb.warmRatio
                             if (tb.redRatio >= 0.03f || tb.warmRatio >= 0.05f || tb.present) {
                                 AutomationStateMachine.addLog(
                                     "VIS red=${"%.2f".format(tb.redRatio)} warm=${"%.2f".format(tb.warmRatio)} present=${tb.present}",
@@ -796,7 +838,12 @@ class AutomationAccessibilityService : AccessibilityService() {
         val now = System.currentTimeMillis()
         if (now - lastScreenshotMs < 350) return null
         lastScreenshotMs = now
-        return suspendCancellableCoroutine { cont ->
+        // Hard timeout: on some devices the screenshot callback simply never
+        // fires. Without this, one hung capture froze ALL visual detection
+        // for a whole session (live, 2026-10-21) — the caller now gets null
+        // after 1.5s and can retry on the next cycle.
+        return withTimeoutOrNull(1500) {
+            suspendCancellableCoroutine { cont ->
             takeScreenshot(0, mainExecutor, object : TakeScreenshotCallback {
                 override fun onSuccess(result: ScreenshotResult) {
                     var bmp: Bitmap? = null
@@ -818,6 +865,7 @@ class AutomationAccessibilityService : AccessibilityService() {
                     if (cont.isActive) cont.resume(null)
                 }
             })
+            }
         }
     }
 
