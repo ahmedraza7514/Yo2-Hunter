@@ -22,7 +22,11 @@ object VisualDetection {
         val tapY: Int
     )
 
-    // Room popup regions — fractions of WIDTH (as in the old app).
+    // Room popup regions — X as fractions of WIDTH, Y as fractions of
+    // HEIGHT. (Until v2.9 the Y values were wrongly computed from the width;
+    // on a tall phone the windows sat at ~0.13h instead of ~0.28h and this
+    // check never saw the popup at all — verified on real captures
+    // 2026-10-21: old window red 0.00 vs height-based 0.89 on popup frames.)
     private const val ICON_LEFT = 0.18f
     private const val ICON_RIGHT = 0.36f
     private const val ICON_TOP = 0.28f
@@ -40,8 +44,8 @@ object VisualDetection {
         val h = bmp.height
         val iconL = (w * ICON_LEFT).toInt()
         val iconR = (w * ICON_RIGHT).toInt()
-        val iconT = (w * ICON_TOP).toInt()
-        val iconB = minOf((w * ICON_BOTTOM).toInt(), h - 1)
+        val iconT = (h * ICON_TOP).toInt()
+        val iconB = minOf((h * ICON_BOTTOM).toInt(), h - 1)
         val tapX = (iconL + iconR) / 2
         val tapY = (iconT + iconB) / 2
         val innerW = (iconR - iconL) / 4
@@ -50,9 +54,9 @@ object VisualDetection {
         val banner = ratios(
             bmp,
             (w * BANNER_LEFT).toInt(),
-            (w * BANNER_TOP).toInt(),
+            (h * BANNER_TOP).toInt(),
             (w * BANNER_RIGHT).toInt(),
-            minOf((w * BANNER_BOTTOM).toInt(), h - 1)
+            minOf((h * BANNER_BOTTOM).toInt(), h - 1)
         )
         val bannerPresent = banner.first >= BANNER_RED_MIN
         val envelopeReady = bannerPresent && inner.first >= ENVELOPE_RED_MIN
