@@ -24,6 +24,10 @@ data class AutomationStats(
     val failed: Int = 0
 )
 
+/**
+ * Shared state between the UI, the foreground service, the accessibility
+ * service and the floating overlay — same role as the old app's state machine.
+ */
 object AutomationStateMachine {
 
     @Volatile
@@ -63,6 +67,7 @@ object AutomationStateMachine {
             try {
                 l()
             } catch (e: Exception) {
+                // listener gone — ignore
             }
         }
     }
@@ -135,6 +140,22 @@ object AutomationStateMachine {
         if (running && currentState != AutomationState.PAUSED) {
             setState(AutomationState.WAITING_FOR_NEXT_ENVELOPE)
         }
+    }
+
+    /** Zero the counters and restart the session clock (user's Reset button). */
+    @Synchronized
+    fun resetStats() {
+        stats = AutomationStats()
+        sessionStartMs = System.currentTimeMillis()
+        addLog("Counters reset", "INFO")
+        notifyChanged()
+    }
+
+    /** Empty the live activity log (user's Clear button). */
+    fun clearLogs() {
+        logs.clear()
+        addLog("Logs cleared", "INFO")
+        notifyChanged()
     }
 
     fun addLog(message: String, tag: String = "INFO") {
