@@ -310,6 +310,7 @@ class AutomationAccessibilityService : AccessibilityService() {
             minOf(((cdSeconds ?: 180) + 45) * 1000L, 7 * 60 * 1000L)
         var lastPreemptTapMs = 0L
         var lastVisualPreemptMs = 0L
+        var lastStayLogMs = 0L
         while (System.currentTimeMillis() < tapDeadline) {
             val root = rootInActiveWindow
             val targets = TargetDetection.scanScreen(
@@ -366,6 +367,19 @@ class AutomationAccessibilityService : AccessibilityService() {
                     try {
                         val tb = VisualDetection.analyzeTopBanner(bmp)
                         if (tb.present) {
+                            // Only a DIRECT banner may preempt: switching to
+                            // another countdown would throw away the countdown
+                            // already running in this room (his rule, 2026-10-21).
+                            val kind = VisualDetection.classifyBanner(bmp)
+                            if (kind != VisualDetection.BannerKind.DIRECT) {
+                                if (now - lastStayLogMs > 4000) {
+                                    lastStayLogMs = now
+                                    AutomationStateMachine.addLog(
+                                        "Banner during countdown is $kind — staying on countdown",
+                                        "FLOW"
+                                    )
+                                }
+                            } else {
                             AutomationStateMachine.addLog(
                                 "Priority banner during countdown — switching",
                                 "FLOW"
@@ -390,6 +404,7 @@ class AutomationAccessibilityService : AccessibilityService() {
                             }
                             // Not direct (another countdown or nothing) —
                             // fall through and keep tapping what is on top.
+                            }
                         }
                     } finally {
                         bmp.recycle()
