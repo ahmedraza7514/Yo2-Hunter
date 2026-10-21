@@ -49,6 +49,11 @@ class AutomationAccessibilityService : AccessibilityService() {
     @Volatile
     private var visualBusy = false
 
+    // Last screen luminance measured by the exit flow's bubble check —
+    // logged when the power tap seems to miss, so the log shows whether
+    // the bubbles never appeared or appeared but read too bright.
+    private var lastBubbleLum = -1f
+
     private val stateListener: () -> Unit = {
         overlayManager?.refresh()
         if (AutomationStateMachine.isRunning()) {
@@ -311,6 +316,8 @@ class AutomationAccessibilityService : AccessibilityService() {
         var lastPreemptTapMs = 0L
         var lastVisualPreemptMs = 0L
         var lastStayLogMs = 0L
+        var popupMissingSince = 0L
+        var lastPopupSeenMs = System.currentTimeMillis()
         while (System.currentTimeMillis() < tapDeadline) {
             val root = rootInActiveWindow
             val targets = TargetDetection.scanScreen(
@@ -380,6 +387,30 @@ class AutomationAccessibilityService : AccessibilityService() {
                                     )
                                 }
                             } else {
+                            // Confirm on a second screenshot ~450ms later — a
+                            // single reading can misjudge a moving banner, and
+                            // a wrong switch throws away this room's countdown.
+                            delay(450)
+                            var kind2 = VisualDetection.BannerKind.UNKNOWN
+                            val bmpB = captureScreen()
+                            if (bmpB != null) {
+                                try {
+                                    if (VisualDetection.analyzeTopBanner(bmpB).present) {
+                                        kind2 = VisualDetection.classifyBanner(bmpB)
+                                    }
+                                } finally {
+                                    bmpB.recycle()
+                                }
+                            }
+                            if (kind2 != VisualDetection.BannerKind.DIRECT) {
+                                if (now - lastStayLogMs > 4000) {
+                                    lastStayLogMs = now
+                                    AutomationStateMachine.addLog(
+                                        "Priority check not confirmed ($kind2) — staying on countdown",
+                                        "FLOW"
+                                    )
+                                }
+                            } else {
                             AutomationStateMachine.addLog(
                                 "Priority banner during countdown — switching",
                                 "FLOW"
@@ -387,23 +418,49 @@ class AutomationAccessibilityService : AccessibilityService() {
                             tapXY(tb.tapX, tb.tapY)
                             delay(900)
                             handleTipsDialog()
-                            val root3 = rootInActiveWindow
-                            val targets3 = TargetDetection.scanScreen(
-                                root3,
-                                prefs.getEnvelopeKeywordsList(),
-                                prefs.getOpenKeywordsList(),
-                                prefs.getSuccessKeywordsList()
-                            )
-                            val directNow2 = targets3.firstOrNull {
-                                it.targetType == TargetDetection.TargetType.OPEN_BUTTON
+                            // Poll for the new popup — it can render late.
+                            // Direct → claim it. A countdown label → we are
+                            // simply on that countdown now; keep tapping it.
+                            // Nothing at all → the switch led nowhere; leave
+                            // cleanly instead of tapping seats.
+                            val pollEnd = System.currentTimeMillis() + 5000
+                            var settled = false
+                            while (System.currentTimeMillis() < pollEnd) {
+                                val root3 = rootInActiveWindow
+                                val targets3 = TargetDetection.scanScreen(
+                                    root3,
+                                    prefs.getEnvelopeKeywordsList(),
+                                    prefs.getOpenKeywordsList(),
+                                    prefs.getSuccessKeywordsList()
+                                )
+                                val directNow2 = targets3.firstOrNull {
+                                    it.targetType == TargetDetection.TargetType.OPEN_BUTTON
+                                }
+                                if (directNow2 != null) {
+                                    tapTarget(directNow2)
+                                    verifyClaim(enteredRoom = true)
+                                    return
+                                }
+                                if (targets3.any {
+                                        it.targetType == TargetDetection.TargetType.COUNTDOWN_LABEL
+                                    }
+                                ) {
+                                    lastPopupSeenMs = System.currentTimeMillis()
+                                    popupMissingSince = 0L
+                                    settled = true
+                                    break
+                                }
+                                delay(300)
                             }
-                            if (directNow2 != null) {
-                                tapTarget(directNow2)
-                                verifyClaim(enteredRoom = true)
+                            if (!settled) {
+                                AutomationStateMachine.addLog(
+                                    "Priority switch found no popup — leaving room",
+                                    "FLOW"
+                                )
+                                exitFlow()
                                 return
                             }
-                            // Not direct (another countdown or nothing) —
-                            // fall through and keep tapping what is on top.
+                            }
                             }
                         }
                     } finally {
@@ -414,9 +471,45 @@ class AutomationAccessibilityService : AccessibilityService() {
             // Fast-tap the countdown label (fresh bounds each cycle).
             val cdNow = targets.firstOrNull { it.targetType == TargetDetection.TargetType.COUNTDOWN_LABEL }
             if (cdNow != null) {
+                popupMissingSince = 0L
+                lastPopupSeenMs = now
                 tapXY(cdNow.bounds.centerX(), cdNow.bounds.centerY())
             } else {
-                tapPoint(OPEN_X, OPEN_Y)
+                // Label node missing. NEVER blind-tap the oval point on a
+                // stale sighting: if the popup itself is gone (claimed by
+                // others / expired / closed — or we just switched rooms and
+                // its popup has not rendered yet), that point is a room
+                // SEAT and the taps open people's profiles (seen live
+                // 2026-10-21). Tap only while the popup was seen recently;
+                // after 2.5s of absence verify visually — the envelope
+                // popup is a big red card on screen.
+                if (popupMissingSince == 0L) popupMissingSince = now
+                if (now - lastPopupSeenMs <= 2500) {
+                    tapPoint(OPEN_X, OPEN_Y)
+                } else if (now - popupMissingSince > 2500) {
+                    val bmp2 = captureScreen()
+                    var cardUp = true // uncertain → treat as up, re-check later
+                    if (bmp2 != null) {
+                        try {
+                            cardUp = VisualDetection.resultScreenRed(bmp2) >= 0.30f
+                        } finally {
+                            bmp2.recycle()
+                        }
+                    }
+                    if (!cardUp) {
+                        AutomationStateMachine.addLog(
+                            "Countdown popup gone — leaving room",
+                            "FLOW"
+                        )
+                        exitFlow()
+                        return
+                    }
+                    lastPopupSeenMs = now
+                    popupMissingSince = now
+                    tapPoint(OPEN_X, OPEN_Y)
+                }
+                // else: popup unseen and the visual check is not due yet —
+                // tap nothing this cycle.
             }
             delay(280)
         }
@@ -557,9 +650,12 @@ class AutomationAccessibilityService : AccessibilityService() {
             delay(900)
         }
         // 2) Power → bubbles → Exit, up to 3 attempts at nearby spots.
+        // Live evidence (2026-10-21): the (0.92, 0.082) spot lands — the
+        // (0.93, 0.080) first try missed twice before the retry saved the
+        // exit — so the proven spot goes first now.
         val powerSpots = listOf(
-            POWER_X to POWER_Y,
             0.92f to 0.082f,
+            POWER_X to POWER_Y,
             0.94f to 0.076f
         )
         var exited = false
@@ -567,7 +663,10 @@ class AutomationAccessibilityService : AccessibilityService() {
             tapPoint(px, py)
             delay(1100)
             if (!bubblesVisible()) {
-                AutomationStateMachine.addLog("Exit: power missed, retrying", "FLOW")
+                AutomationStateMachine.addLog(
+                    "Exit: power missed, retrying (lum=${"%.0f".format(lastBubbleLum)})",
+                    "FLOW"
+                )
                 continue
             }
             tapPoint(EXIT_X, EXIT_Y)
@@ -622,7 +721,8 @@ class AutomationAccessibilityService : AccessibilityService() {
         }
         val bmp = captureScreen() ?: return false
         return try {
-            meanLuminance(bmp) < 45f
+            lastBubbleLum = meanLuminance(bmp)
+            lastBubbleLum < 45f
         } finally {
             bmp.recycle()
         }
