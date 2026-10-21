@@ -390,7 +390,7 @@ class AutomationAccessibilityService : AccessibilityService() {
 
     private suspend fun verifyClaim(enteredRoom: Boolean) {
         AutomationStateMachine.onClaimPending()
-        val deadline = System.currentTimeMillis() + 10_000
+        val deadline = System.currentTimeMillis() + 15_000
         var openRetries = 0
         var lastRetryMs = 0L
         var lastVisualMs = 0L
