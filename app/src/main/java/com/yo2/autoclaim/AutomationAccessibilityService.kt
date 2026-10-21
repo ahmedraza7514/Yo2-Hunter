@@ -3,6 +3,7 @@ package com.yo2.autoclaim
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
@@ -524,16 +525,117 @@ class AutomationAccessibilityService : AccessibilityService() {
         return best
     }
 
-    /** Exit flow — X under the envelope → power → lower Exit bubble. Never linger. */
+    /**
+     * Exit flow — X under the envelope → power → Exit bubble. Every step is
+     * VERIFIED and retried: blind taps kept missing the small power icon
+     * (v2.4/v2.5 live tests), so now the flow checks its own work —
+     * the red card must be gone, the Keep/Exit bubbles screen must be up
+     * (it dims the room almost to black: measured mean luminance ~16 vs
+     * ~110 in a normal room), and the profile screen must be back.
+     */
     private suspend fun exitFlow() {
+        // 1) Close the result panel / popup; re-tap the X if the card stays.
         tapPoint(CLOSE_X, CLOSE_Y)
-        delay(1000)
-        tapPoint(POWER_X, POWER_Y)
-        delay(1200)
-        tapPoint(EXIT_X, EXIT_Y)
         delay(900)
-        AutomationStateMachine.addLog("Exit flow done — waiting for next banner", "FLOW")
+        if (redCardVisible()) {
+            tapPoint(CLOSE_X, 0.75f)
+            delay(900)
+        }
+        // 2) Power → bubbles → Exit, up to 3 attempts at nearby spots.
+        val powerSpots = listOf(
+            POWER_X to POWER_Y,
+            0.92f to 0.082f,
+            0.94f to 0.076f
+        )
+        var exited = false
+        for ((px, py) in powerSpots) {
+            tapPoint(px, py)
+            delay(1100)
+            if (!bubblesVisible()) {
+                AutomationStateMachine.addLog("Exit: power missed, retrying", "FLOW")
+                continue
+            }
+            tapPoint(EXIT_X, EXIT_Y)
+            delay(1300)
+            if (outOfRoom()) {
+                exited = true
+                break
+            }
+            if (bubblesVisible()) {
+                // Bubbles still up — the Exit tap missed the bubble itself.
+                tapPoint(EXIT_X, 0.63f)
+                delay(1300)
+                if (outOfRoom()) {
+                    exited = true
+                    break
+                }
+            } else {
+                // Bubbles gone after the Exit tap — the tap landed.
+                exited = true
+                break
+            }
+        }
+        val tail = rootInActiveWindow?.let {
+            TargetDetection.collectTexts(it).take(3).joinToString(" | ") { t -> t.take(22) }
+        } ?: ""
+        AutomationStateMachine.addLog(
+            if (exited) "Exit flow done — out of the room [$tail]"
+            else "Exit flow done — exit unconfirmed [$tail]",
+            "FLOW"
+        )
         delay(prefs.cooldownMs)
+    }
+
+    /** Is the big red result card / envelope popup still on screen? */
+    private suspend fun redCardVisible(): Boolean {
+        val bmp = captureScreen() ?: return false
+        return try {
+            VisualDetection.resultScreenRed(bmp) >= 0.30f
+        } finally {
+            bmp.recycle()
+        }
+    }
+
+    /** Are the Keep/Exit bubbles up? Their overlay dims the room to near-black. */
+    private suspend fun bubblesVisible(): Boolean {
+        val root = rootInActiveWindow
+        if (root != null) {
+            val texts = TargetDetection.collectTexts(root)
+            val hasExit = texts.any { it.trim().equals("exit", ignoreCase = true) }
+            val hasKeep = texts.any { it.trim().equals("keep", ignoreCase = true) }
+            if (hasExit && hasKeep) return true
+        }
+        val bmp = captureScreen() ?: return false
+        return try {
+            meanLuminance(bmp) < 45f
+        } finally {
+            bmp.recycle()
+        }
+    }
+
+    private fun meanLuminance(bmp: Bitmap): Float {
+        val small = Bitmap.createScaledBitmap(bmp, 48, 96, false)
+        var sum = 0L
+        var n = 0
+        for (x in 0 until small.width) {
+            for (y in 0 until small.height) {
+                val c = small.getPixel(x, y)
+                sum += (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
+                n++
+            }
+        }
+        small.recycle()
+        return if (n == 0) 255f else sum.toFloat() / n
+    }
+
+    /** Back on the profile page? Its Recharge / Balance labels are the marker. */
+    private fun outOfRoom(): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val texts = TargetDetection.collectTexts(root)
+        return texts.any {
+            it.contains("Recharge", ignoreCase = true) ||
+                it.contains("Balance", ignoreCase = true)
+        }
     }
 
     // ------------------------------------------------------------------ taps
@@ -619,8 +721,8 @@ class AutomationAccessibilityService : AccessibilityService() {
         private const val OPEN_Y = 0.62f
         private const val CLOSE_X = 0.5f
         private const val CLOSE_Y = 0.765f
-        private const val POWER_X = 0.92f
-        private const val POWER_Y = 0.082f
+        private const val POWER_X = 0.93f
+        private const val POWER_Y = 0.08f
         private const val EXIT_X = 0.5f
         private const val EXIT_Y = 0.607f
 
