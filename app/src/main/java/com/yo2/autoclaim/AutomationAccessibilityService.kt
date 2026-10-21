@@ -302,7 +302,7 @@ class AutomationAccessibilityService : AccessibilityService() {
         var openBtn: TargetDetection.IdentifiedTarget? = null
         var countdown: TargetDetection.IdentifiedTarget? = null
         var visualReady: VisualDetection.Result? = null
-        val classifyDeadline = System.currentTimeMillis() + 12_000
+        val classifyDeadline = System.currentTimeMillis() + 20_000
         var cycle = 0
         while (System.currentTimeMillis() < classifyDeadline) {
             val root = rootInActiveWindow
@@ -338,8 +338,75 @@ class AutomationAccessibilityService : AccessibilityService() {
         }
 
         if (!enteredRoom) {
-            AutomationStateMachine.onClaimFailed("room popup not found")
-            return
+            if (outOfRoom()) {
+                // The banner tap never entered a room at all.
+                AutomationStateMachine.onClaimFailed("room popup not found")
+                return
+            }
+            // We ARE in a room (no profile markers) but its popup is late.
+            // Failing here used to strand the flow inside the room, where it
+            // re-tapped crossing banners and failed again and again (live
+            // test 2026-10-21 23:52 — four straight "room popup not found").
+            // Watch safely instead: no taps unless a popup actually shows.
+            AutomationStateMachine.addLog(
+                "In room but popup late — watching without taps",
+                "FLOW"
+            )
+            val watchDeadline = System.currentTimeMillis() + 90_000
+            var watchCycle = 0
+            while (System.currentTimeMillis() < watchDeadline) {
+                val wTargets = TargetDetection.scanScreen(
+                    rootInActiveWindow,
+                    prefs.getEnvelopeKeywordsList(),
+                    prefs.getOpenKeywordsList(),
+                    prefs.getSuccessKeywordsList()
+                )
+                openBtn = wTargets.firstOrNull {
+                    it.targetType == TargetDetection.TargetType.OPEN_BUTTON
+                }
+                countdown = wTargets.firstOrNull {
+                    it.targetType == TargetDetection.TargetType.COUNTDOWN_LABEL
+                }
+                if (openBtn != null || countdown != null) {
+                    enteredRoom = true
+                    break
+                }
+                if (wTargets.any { isRealConfirmation(it) }) {
+                    verifyClaim(enteredRoom = true)
+                    return
+                }
+                if (watchCycle % 3 == 0) {
+                    val bmp = captureScreen()
+                    if (bmp != null) {
+                        try {
+                            val vr = VisualDetection.analyzeBanner(bmp)
+                            if (vr.envelopeReady) {
+                                visualReady = vr
+                                enteredRoom = true
+                                break
+                            }
+                        } finally {
+                            bmp.recycle()
+                        }
+                    }
+                }
+                if (outOfRoom()) break
+                watchCycle++
+                delay(300)
+            }
+            if (!enteredRoom) {
+                if (outOfRoom()) {
+                    AutomationStateMachine.onClaimFailed("room popup not found")
+                } else {
+                    AutomationStateMachine.addLog(
+                        "Popup never appeared — leaving room",
+                        "FLOW"
+                    )
+                    AutomationStateMachine.onClaimFailed("popup never appeared")
+                    exitFlow()
+                }
+                return
+            }
         }
 
         // 4a) DIRECT — tap Open now.
@@ -409,7 +476,7 @@ class AutomationAccessibilityService : AccessibilityService() {
             // banner crossing during a countdown. Only a screenshot can.
             // Check the top strip about once a second; a fresh banner preempts
             // the countdown immediately (direct envelopes are first priority).
-            if (now - lastVisualPreemptMs > 900) {
+            if (now - lastVisualPreemptMs > 500) {
                 lastVisualPreemptMs = now
                 val bmp = captureScreen()
                 if (bmp != null) {
@@ -418,37 +485,35 @@ class AutomationAccessibilityService : AccessibilityService() {
                         if (tb.present) {
                             // Only a DIRECT banner may preempt: switching to
                             // another countdown would throw away the countdown
-                            // already running in this room (his rule, 2026-10-21).
-                            val kind = VisualDetection.classifyBanner(bmp)
-                            if (kind != VisualDetection.BannerKind.DIRECT) {
-                                if (now - lastStayLogMs > 4000) {
-                                    lastStayLogMs = now
-                                    AutomationStateMachine.addLog(
-                                        "Banner during countdown is $kind — staying on countdown",
-                                        "FLOW"
-                                    )
-                                }
-                            } else {
-                            // Confirm on a second screenshot ~450ms later — a
-                            // single reading can misjudge a moving banner, and
-                            // a wrong switch throws away this room's countdown.
-                            delay(450)
-                            var kind2 = VisualDetection.BannerKind.UNKNOWN
-                            val bmpB = captureScreen()
-                            if (bmpB != null) {
+                            // already running in this room (his rule,
+                            // 2026-10-21). But a crossing lasts only ~2-3s
+                            // and edge reads classify UNKNOWN (live
+                            // 2026-10-22 00:00: a real DIRECT banner crossed
+                            // a 413s countdown, read UNKNOWN once and was
+                            // gone) — so re-read up to 3 times, ~300ms
+                            // apart. Any DIRECT read switches; any COUNTDOWN
+                            // read vetoes the switch at once.
+                            var verdict = VisualDetection.classifyBanner(bmp)
+                            var freshTapX = tb.tapX
+                            var reads = 1
+                            while (verdict == VisualDetection.BannerKind.UNKNOWN && reads < 3) {
+                                delay(300)
+                                val bmpR = captureScreen() ?: break
                                 try {
-                                    if (VisualDetection.analyzeTopBanner(bmpB).present) {
-                                        kind2 = VisualDetection.classifyBanner(bmpB)
-                                    }
+                                    val tbR = VisualDetection.analyzeTopBanner(bmpR)
+                                    if (!tbR.present) break
+                                    verdict = VisualDetection.classifyBanner(bmpR)
+                                    freshTapX = tbR.tapX
                                 } finally {
-                                    bmpB.recycle()
+                                    bmpR.recycle()
                                 }
+                                reads++
                             }
-                            if (kind2 != VisualDetection.BannerKind.DIRECT) {
+                            if (verdict != VisualDetection.BannerKind.DIRECT) {
                                 if (now - lastStayLogMs > 4000) {
                                     lastStayLogMs = now
                                     AutomationStateMachine.addLog(
-                                        "Priority check not confirmed ($kind2) — staying on countdown",
+                                        "Banner during countdown is $verdict (x$reads) — staying on countdown",
                                         "FLOW"
                                     )
                                 }
@@ -457,7 +522,7 @@ class AutomationAccessibilityService : AccessibilityService() {
                                 "Priority banner during countdown — switching",
                                 "FLOW"
                             )
-                            tapXY(tb.tapX, tb.tapY)
+                            tapXY(freshTapX, tb.tapY)
                             delay(900)
                             handleTipsDialog()
                             // Poll for the new popup — it can render late.
@@ -501,7 +566,6 @@ class AutomationAccessibilityService : AccessibilityService() {
                                 )
                                 exitFlow()
                                 return
-                            }
                             }
                             }
                         }
