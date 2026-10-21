@@ -177,7 +177,7 @@ class AutomationAccessibilityService : AccessibilityService() {
 
         // Visual fallback for the top banner — runs in its own coroutine so a
         // slow screenshot never blocks the fast node scans.
-        if (now - lastVisualMs > 1100 && now - lastBannerTapMs > BANNER_THROTTLE_MS && !visualBusy) {
+        if (now - lastVisualMs > 800 && now - lastBannerTapMs > BANNER_THROTTLE_MS && !visualBusy) {
             lastVisualMs = now
             visualBusy = true
             serviceScope.launch {
@@ -308,6 +308,7 @@ class AutomationAccessibilityService : AccessibilityService() {
         val tapDeadline = System.currentTimeMillis() +
             minOf(((cdSeconds ?: 180) + 45) * 1000L, 7 * 60 * 1000L)
         var lastPreemptTapMs = 0L
+        var lastVisualPreemptMs = 0L
         while (System.currentTimeMillis() < tapDeadline) {
             val root = rootInActiveWindow
             val targets = TargetDetection.scanScreen(
@@ -352,6 +353,48 @@ class AutomationAccessibilityService : AccessibilityService() {
                     return
                 }
             }
+            // PRIORITY RULE (visual): the banner is canvas-drawn, so it NEVER
+            // appears in the node tree — the node check above can never see a
+            // banner crossing during a countdown. Only a screenshot can.
+            // Check the top strip about once a second; a fresh banner preempts
+            // the countdown immediately (direct envelopes are first priority).
+            if (now - lastVisualPreemptMs > 900) {
+                lastVisualPreemptMs = now
+                val bmp = captureScreen()
+                if (bmp != null) {
+                    try {
+                        val tb = VisualDetection.analyzeTopBanner(bmp)
+                        if (tb.present) {
+                            AutomationStateMachine.addLog(
+                                "Priority banner during countdown — switching",
+                                "FLOW"
+                            )
+                            tapXY(tb.tapX, tb.tapY)
+                            delay(900)
+                            handleTipsDialog()
+                            val root3 = rootInActiveWindow
+                            val targets3 = TargetDetection.scanScreen(
+                                root3,
+                                prefs.getEnvelopeKeywordsList(),
+                                prefs.getOpenKeywordsList(),
+                                prefs.getSuccessKeywordsList()
+                            )
+                            val directNow2 = targets3.firstOrNull {
+                                it.targetType == TargetDetection.TargetType.OPEN_BUTTON
+                            }
+                            if (directNow2 != null) {
+                                tapTarget(directNow2)
+                                verifyClaim(enteredRoom = true)
+                                return
+                            }
+                            // Not direct (another countdown or nothing) —
+                            // fall through and keep tapping what is on top.
+                        }
+                    } finally {
+                        bmp.recycle()
+                    }
+                }
+            }
             // Fast-tap the countdown label (fresh bounds each cycle).
             val cdNow = targets.firstOrNull { it.targetType == TargetDetection.TargetType.COUNTDOWN_LABEL }
             if (cdNow != null) {
@@ -390,6 +433,8 @@ class AutomationAccessibilityService : AccessibilityService() {
 
     private suspend fun verifyClaim(enteredRoom: Boolean) {
         AutomationStateMachine.onClaimPending()
+        // 15s: the result panel can arrive late (measured on a real capture —
+        // Open tapped 10:47:21, panel only appeared after the old 10s window).
         val deadline = System.currentTimeMillis() + 15_000
         var openRetries = 0
         var lastRetryMs = 0L
@@ -564,17 +609,20 @@ class AutomationAccessibilityService : AccessibilityService() {
         var isServiceConnected: Boolean = false
             private set
 
-        // Fixed tap points (fractions). OPEN from the proven old app; the exit
-        // points are the YO2-HUNTER spec values, with CLOSE re-measured from
-        // a real capture (gold X centroid at 0.493w, 0.764h).
+        // Fixed tap points (fractions). OPEN from the proven old app. Exit
+        // points measured from the reference screenshots (2026-10-21): the
+        // power icon centre is (0.920w, 0.082h) and the Exit bubble centre is
+        // (0.500w, 0.607h) — the old spec guesses (0.94, 0.11) and (0.50, 0.66)
+        // landed beside the icons, so the taps never registered. CLOSE was
+        // re-measured from a real capture (gold X centroid at 0.493w, 0.764h).
         private const val OPEN_X = 0.5f
         private const val OPEN_Y = 0.62f
         private const val CLOSE_X = 0.5f
         private const val CLOSE_Y = 0.765f
-        private const val POWER_X = 0.94f
-        private const val POWER_Y = 0.11f
+        private const val POWER_X = 0.92f
+        private const val POWER_Y = 0.082f
         private const val EXIT_X = 0.5f
-        private const val EXIT_Y = 0.66f
+        private const val EXIT_Y = 0.607f
 
         // Tips dialog OK (YO2-HUNTER spec).
         private const val TIPS_OK_X = 0.75f
