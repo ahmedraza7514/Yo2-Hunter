@@ -114,6 +114,23 @@ object VisualDetection {
         return TopBannerResult(present, redRatio, warmRatio, tapX, (top + bottom) / 2)
     }
 
+    /**
+     * Strict-red ratio over the central card region. The claim RESULT screen
+     * ("Deposited into your account / Received x/x") is one big red card —
+     * measured 0.49 on a real capture, vs 0.00 for a plain room — so >= 0.30
+     * means the claim screen is showing. (Its text is canvas-drawn and never
+     * appears in the accessibility tree, so nodes alone can't confirm it.)
+     */
+    fun resultScreenRed(bmp: Bitmap): Float {
+        val w = bmp.width
+        val h = bmp.height
+        return ratios(
+            bmp,
+            (w * 0.10f).toInt(), (h * 0.25f).toInt(),
+            (w * 0.90f).toInt(), (h * 0.72f).toInt()
+        ).first
+    }
+
     /** Returns (redRatio, goldRatio) for a region, sampling every 3rd pixel. */
     private fun ratios(bmp: Bitmap, left: Int, top: Int, right: Int, bottom: Int): Pair<Float, Float> {
         val l = left.coerceIn(0, bmp.width - 1)
