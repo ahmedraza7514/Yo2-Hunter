@@ -34,6 +34,13 @@ object TargetDetection {
     // (the banner writes the multiplier with a "×" sign, not the letter "x").
     private val ALWAYS_ENVELOPE_TOKENS = listOf("×9999", "×39999", "×99999", "lucky money")
 
+    // A longer label may still be a countdown ("Open after 07:08") — accept
+    // up to 24 chars when it also carries one of these hints; a bare MM:SS
+    // in a long text is more likely a chat timestamp than a popup timer.
+    private val countdownHints = listOf(
+        "open", "after", "left", "countdown", "lucky", "ready", "in "
+    )
+
     private val failedTexts = listOf(
         "received completely", // NOTE: this phrase means empty-but-shown; handled by caller context
         "too late", "already finished", "has been received", "抢光了", "已抢完", "no more"
@@ -97,7 +104,10 @@ object TargetDetection {
                         results.add(IdentifiedTarget(node, bounds, TargetType.OPEN_BUTTON, text))
                     }
                     // Countdown label: a timer with MM:SS or "NN s".
-                    parseCountdownSeconds(text) != null && text.length <= 12 -> {
+                    parseCountdownSeconds(text) != null &&
+                        (text.length <= 12 ||
+                            (text.length <= 24 &&
+                                countdownHints.any { lower.contains(it) })) -> {
                         results.add(
                             IdentifiedTarget(
                                 node, bounds, TargetType.COUNTDOWN_LABEL, text,
