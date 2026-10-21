@@ -393,6 +393,7 @@ class AutomationAccessibilityService : AccessibilityService() {
         val deadline = System.currentTimeMillis() + 10_000
         var openRetries = 0
         var lastRetryMs = 0L
+        var lastVisualMs = 0L
         while (System.currentTimeMillis() < deadline) {
             val root = rootInActiveWindow
             val targets = TargetDetection.scanScreen(
@@ -401,6 +402,30 @@ class AutomationAccessibilityService : AccessibilityService() {
                 prefs.getOpenKeywordsList(),
                 prefs.getSuccessKeywordsList()
             )
+            // Visual confirmation — the result screen is canvas-drawn, so its
+            // text never reaches the node tree; its big red card does show in
+            // a screenshot (measured red 0.49 vs 0.00 for a plain room).
+            val vNow = System.currentTimeMillis()
+            if (vNow - lastVisualMs > 700) {
+                lastVisualMs = vNow
+                val bmp = captureScreen()
+                if (bmp != null) {
+                    try {
+                        val cardRed = VisualDetection.resultScreenRed(bmp)
+                        if (cardRed >= 0.30f) {
+                            AutomationStateMachine.onClaimConfirmed("result screen (visual)")
+                            NotificationHelper.triggerClaimSuccessFeedback(
+                                this, prefs.enableSound, prefs.enableVibration
+                            )
+                            delay(700)
+                            if (enteredRoom) exitFlow()
+                            return
+                        }
+                    } finally {
+                        bmp.recycle()
+                    }
+                }
+            }
             val confirmation = targets.firstOrNull { isRealConfirmation(it) }
             if (confirmation != null) {
                 val coins = extractCoins(root)
@@ -457,11 +482,11 @@ class AutomationAccessibilityService : AccessibilityService() {
     /** Exit flow — X under the envelope → power → lower Exit bubble. Never linger. */
     private suspend fun exitFlow() {
         tapPoint(CLOSE_X, CLOSE_Y)
-        delay(750)
+        delay(1000)
         tapPoint(POWER_X, POWER_Y)
-        delay(950)
+        delay(1200)
         tapPoint(EXIT_X, EXIT_Y)
-        delay(800)
+        delay(900)
         AutomationStateMachine.addLog("Exit flow done — waiting for next banner", "FLOW")
         delay(prefs.cooldownMs)
     }
@@ -539,15 +564,17 @@ class AutomationAccessibilityService : AccessibilityService() {
         var isServiceConnected: Boolean = false
             private set
 
-        // Fixed tap points (fractions) — from the proven old app.
+        // Fixed tap points (fractions). OPEN from the proven old app; the exit
+        // points are the YO2-HUNTER spec values, with CLOSE re-measured from
+        // a real capture (gold X centroid at 0.493w, 0.764h).
         private const val OPEN_X = 0.5f
         private const val OPEN_Y = 0.62f
         private const val CLOSE_X = 0.5f
-        private const val CLOSE_Y = 0.755f
-        private const val POWER_X = 0.918f
-        private const val POWER_Y = 0.083f
+        private const val CLOSE_Y = 0.765f
+        private const val POWER_X = 0.94f
+        private const val POWER_Y = 0.11f
         private const val EXIT_X = 0.5f
-        private const val EXIT_Y = 0.607f
+        private const val EXIT_Y = 0.66f
 
         // Tips dialog OK (YO2-HUNTER spec).
         private const val TIPS_OK_X = 0.75f
